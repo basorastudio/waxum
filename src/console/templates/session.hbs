@@ -28,7 +28,6 @@
       <div class="session-meta">
         <span class="status-pill {{status_class}}"><span class="status-dot"></span>{{status_label}}</span>
         {{#if phone}}<span class="phone mono">{{phone}}</span>{{/if}}
-        <span class="mono" style="color:var(--color-text-secondary)">{{storage_path}}</span>
       </div>
     </div>
   </section>
@@ -36,7 +35,6 @@
   <section id="pair-panel" class="pair-panel panel" hidden>
     <header class="panel-head">
       <span class="panel-title">Pair session</span>
-      <span class="panel-serial">PANEL.00</span>
     </header>
     <div class="pair-body">
       <div class="pair-left">
@@ -64,36 +62,39 @@
           Enter this code on your phone: <b>Linked devices → Link with phone number instead</b>.
         </div>
         <div id="pair-error" class="err" hidden></div>
+        <div class="pair-caption">
+          No camera handy? Waxum issues an 8-character code instead — enter
+          the same phone number tied to this WhatsApp account, then type the
+          code under <b>Linked devices → Link with phone number instead</b>.
+        </div>
       </div>
     </div>
   </section>
 
   <div class="playground">
-    <nav class="pg-tabs" id="pg-tabs" aria-label="Playground tabs"></nav>
-
     <section class="pg-body">
-      <div class="pg-endpoints panel">
+      <div class="pg-sidebar panel">
         <header class="panel-head">
-          <span class="panel-title" id="pg-tab-title">Endpoints</span>
-          <span class="panel-serial">PANEL.03</span>
+          <span class="panel-title">Endpoints</span>
+          <span class="mono" style="font-size:var(--font-size-xs);color:var(--color-text-secondary)" id="pg-endpoint-count">—</span>
         </header>
-        <div id="pg-endpoint-list" class="pg-endpoint-list"></div>
+        <div id="pg-sidebar-tree" class="pg-sidebar-tree"></div>
       </div>
 
       <div class="pg-workbench panel">
         <header class="panel-head">
           <span class="panel-title" id="pg-current-label">Pick an endpoint</span>
-          <span class="panel-serial mono" id="pg-current-method">—</span>
+          <span class="mono" style="font-size:var(--font-size-xs);color:var(--color-text-secondary)" id="pg-current-method">—</span>
         </header>
         <div class="pg-form" id="pg-form">
-          <div class="empty">Choose a tab, then click an endpoint on the left to load its form here.</div>
+          <div class="empty">Pick an endpoint from the left to load its form here.</div>
         </div>
       </div>
 
       <div class="pg-result panel">
         <header class="panel-head">
           <span class="panel-title">Response</span>
-          <span class="panel-serial mono" id="pg-result-status">—</span>
+          <span class="mono" style="font-size:var(--font-size-xs);color:var(--color-text-secondary)" id="pg-result-status">—</span>
         </header>
         <pre id="pg-result-body" class="pg-result-body"><span style="color:var(--color-text-secondary)">No request sent yet.</span></pre>
       </div>
@@ -105,9 +106,8 @@
 <script src="/assets/playground.js"></script>
 <script>
 (function () {
-  const tabsEl = document.getElementById('pg-tabs');
-  const listEl = document.getElementById('pg-endpoint-list');
-  const titleEl = document.getElementById('pg-tab-title');
+  const sidebarEl = document.getElementById('pg-sidebar-tree');
+  const countEl = document.getElementById('pg-endpoint-count');
   const formEl = document.getElementById('pg-form');
   const curLabelEl = document.getElementById('pg-current-label');
   const curMethodEl = document.getElementById('pg-current-method');
@@ -118,40 +118,48 @@
   const endpoints = window.__ENDPOINTS__ || [];
   const groups = window.__GROUP_META__ || {};
   const groupKeys = Array.from(new Set(endpoints.map(e => e.group)));
-  let activeGroup = groupKeys[0];
+  const expandedGroups = new Set([groupKeys[0]]);
   let activeEndpoint = null;
 
-  function renderTabs() {
-    tabsEl.innerHTML = '';
+  countEl.textContent = endpoints.length + ' total';
+
+  function renderSidebar() {
+    sidebarEl.innerHTML = '';
     groupKeys.forEach(g => {
       const meta = groups[g] || { title: g };
-      const btn = document.createElement('button');
-      btn.className = 'pg-tab' + (g === activeGroup ? ' active' : '');
-      btn.type = 'button';
-      btn.dataset.g = g;
-      btn.innerHTML = '<svg class="icon sm"><use href="#' + (meta.icon || 'i-dot') + '"/></svg>' +
-        '<span>' + meta.title + '</span>';
-      btn.addEventListener('click', () => { activeGroup = g; renderTabs(); renderList(); });
-      tabsEl.appendChild(btn);
-    });
-  }
+      const items = endpoints.filter(e => e.group === g);
 
-  function renderList() {
-    const items = endpoints.filter(e => e.group === activeGroup);
-    const meta = groups[activeGroup] || {};
-    titleEl.textContent = meta.title || activeGroup;
-    listEl.innerHTML = '';
-    items.forEach(ep => {
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.className = 'pg-endpoint' + (ep.danger ? ' danger' : '') +
-        (activeEndpoint && activeEndpoint.key === ep.key && activeEndpoint.group === ep.group ? ' active' : '');
-      row.innerHTML =
-        '<span class="method m-' + ep.method.toLowerCase() + '">' + ep.method + '</span>' +
-        '<span class="label">' + ep.label + '</span>' +
-        '<span class="path mono">' + ep.path.replace('/api/v1/sessions/{sid}', '') + '</span>';
-      row.addEventListener('click', () => { activeEndpoint = ep; renderList(); renderForm(); });
-      listEl.appendChild(row);
+      const details = document.createElement('details');
+      details.className = 'pg-group';
+      details.open = expandedGroups.has(g);
+      details.addEventListener('toggle', () => {
+        if (details.open) expandedGroups.add(g); else expandedGroups.delete(g);
+      });
+
+      const summary = document.createElement('summary');
+      summary.className = 'pg-group-head';
+      summary.innerHTML =
+        '<svg class="icon sm"><use href="#' + (meta.icon || 'i-dot') + '"/></svg>' +
+        '<span class="pg-group-title">' + meta.title + '</span>' +
+        '<span class="pg-group-count">' + items.length + '</span>';
+      details.appendChild(summary);
+
+      const list = document.createElement('div');
+      list.className = 'pg-group-items';
+      items.forEach(ep => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'pg-endpoint' + (ep.danger ? ' danger' : '') +
+          (activeEndpoint && activeEndpoint.key === ep.key && activeEndpoint.group === ep.group ? ' active' : '');
+        row.innerHTML =
+          '<span class="method m-' + ep.method.toLowerCase() + '">' + ep.method + '</span>' +
+          '<span class="label">' + ep.label + '</span>' +
+          '<span class="path mono">' + ep.path.replace('/api/v1/sessions/{sid}', '') + '</span>';
+        row.addEventListener('click', () => { activeEndpoint = ep; renderSidebar(); renderForm(); });
+        list.appendChild(row);
+      });
+      details.appendChild(list);
+      sidebarEl.appendChild(details);
     });
   }
 
@@ -359,8 +367,7 @@
     });
   }
 
-  renderTabs();
-  renderList();
+  renderSidebar();
 
   const pairPanel   = document.getElementById('pair-panel');
   const pairQr      = document.getElementById('pair-qr');

@@ -2,6 +2,36 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.6] - 2026-07-24
+
+### Changed — session detail page cleanup
+
+Follow-up polish pass on the session detail page after feedback that
+it "felt unprofessional" — four concrete issues, fixed:
+
+- The session's raw filesystem storage path (an absolute local disk
+  path, e.g. `/var/.../sessions/<id>`) was dumped as plain text under
+  the session title. It's operator-only debug info, not something a
+  console visitor needs to see — removed from the header.
+- The old "PANEL.00" / "PANEL.01" / "PANEL.02" / "PANEL.03" fake
+  serial-number labels (leftovers from the earlier redesign's
+  hardware-panel aesthetic) are gone site-wide. Two were replaced
+  with actually useful counts (total sessions, endpoint count); the
+  rest were just noise.
+- The "Pair session" panel had a large unbalanced empty gap under the
+  phone-pairing column versus the QR column. Fixed the alignment
+  (`align-items: center` instead of `start`, dropped a hardcoded
+  `padding-top: 90px` hack) and added a short explanatory caption
+  under "Request pair code" so both columns carry a similar amount of
+  content.
+- The playground's endpoint browser — a horizontal pill-tab row above
+  a 3-pane grid — is now a single collapsible sidebar tree (grouped,
+  expand/collapse per group, ~90 endpoints across 15 groups) next to
+  a 2-pane form/response layout, closer to Postman/Insomnia than the
+  old tab bar. Scales better as more endpoint groups get added.
+- Verified with fresh Playwright screenshots, light and dark, overview
+  and session detail (including an expanded group + loaded form).
+
 ## [0.9.5] - 2026-07-24
 
 ### Changed — console redesign

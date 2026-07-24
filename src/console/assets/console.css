@@ -629,7 +629,7 @@ a:hover { text-decoration: underline; }
   grid-template-columns: 240px 44px 1fr;
   gap: var(--spacing-6);
   padding: var(--spacing-6);
-  align-items: start;
+  align-items: center;
 }
 .pair-left, .pair-right {
   display: flex;
@@ -663,13 +663,11 @@ a:hover { text-decoration: underline; }
 }
 .pair-caption b { color: var(--color-text-primary); font-weight: var(--font-weight-semibold); }
 .pair-divider {
-  align-self: center;
   justify-self: center;
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-base);
   color: var(--color-text-secondary);
   text-transform: lowercase;
-  padding-top: 90px;
 }
 .pair-right input[type="text"] {
   width: 100%;
@@ -701,7 +699,6 @@ a:hover { text-decoration: underline; }
 
 @media (max-width: 780px) {
   .pair-body { grid-template-columns: 1fr; }
-  .pair-divider { padding-top: 0; }
   .pair-qr { width: 100%; height: auto; aspect-ratio: 1/1; }
 }
 
@@ -711,56 +708,54 @@ a:hover { text-decoration: underline; }
   flex-direction: column;
   gap: var(--spacing-5);
 }
-.pg-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--spacing-2);
-}
-.pg-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--spacing-2);
-  background: var(--color-background-surface);
-  border: var(--border-width) solid var(--color-border);
-  border-radius: var(--radius-full);
-  height: var(--size-element-sm);
-  padding: 0 var(--spacing-3);
-  font-family: var(--font-family-body);
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease-standard),
-              color var(--duration-fast) var(--ease-standard);
-}
-.pg-tab:hover { background: var(--color-overlay-hover); color: var(--color-text-primary); }
-.pg-tab.active {
-  background: var(--color-accent);
-  color: var(--color-on-accent);
-  border-color: var(--color-accent);
-}
-.pg-tab.active svg { color: var(--color-on-accent); }
-
 .pg-body {
   display: grid;
   grid-template-columns: 300px 1fr 1fr;
   gap: var(--spacing-5);
+  align-items: start;
 }
 
-.pg-endpoint-list {
-  padding: 0;
-  max-height: 640px;
-  overflow-y: auto;
+/* Sidebar tree: one collapsible <details> per group, endpoints nested
+   inside — a single-list nav+picker instead of a top tab row plus a
+   separate flat endpoint list. */
+.pg-sidebar { max-height: 720px; overflow-y: auto; }
+.pg-sidebar-tree { padding: var(--spacing-2) 0; }
+.pg-group + .pg-group { border-top: var(--border-width) solid var(--color-border); }
+.pg-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2-5, 10px) var(--spacing-4);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background var(--duration-fast) linear, color var(--duration-fast) linear;
 }
+.pg-group-head::-webkit-details-marker { display: none; }
+.pg-group-head:hover { background: var(--color-overlay-hover); color: var(--color-text-primary); }
+.pg-group[open] > .pg-group-head { color: var(--color-text-primary); }
+.pg-group-head svg { color: currentColor; }
+.pg-group-title { flex: 1; }
+.pg-group-count {
+  font-family: var(--font-family-code);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  background: var(--color-background-muted);
+  border-radius: var(--radius-full);
+  padding: 1px var(--spacing-2);
+}
+.pg-group-items { display: flex; flex-direction: column; }
 .pg-endpoint {
   display: grid;
   grid-template-columns: 54px 1fr;
   grid-template-rows: auto auto;
   gap: 2px var(--spacing-2-5, 10px);
   width: 100%;
-  padding: var(--spacing-3) var(--spacing-5);
+  padding: var(--spacing-2) var(--spacing-4) var(--spacing-2) var(--spacing-7);
   border: none;
-  border-bottom: var(--border-width) solid var(--color-border);
   background: var(--color-background-card);
   cursor: pointer;
   text-align: left;
