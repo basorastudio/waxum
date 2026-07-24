@@ -2,6 +2,48 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.5] - 2026-07-24
+
+### Changed — console redesign
+
+Full visual pass on the console (fleet overview, session detail,
+playground, login), replacing the old hard-shadow/halftone look with
+design tokens hand-copied from [Astryx](https://www.npmjs.com/package/@astryxdesign/core)
+(Meta's open-source design system) — colors, spacing, radius, shadow,
+and type scale, applied to the existing server-rendered
+Handlebars/vanilla-CSS console with **no new build step or JS
+framework**: no React, no Bun bundling, nothing added to the binary's
+build requirements. `console.css` is a hand-written implementation of
+Astryx's neutral theme values, not a package import.
+
+- Dark mode, automatically, via CSS `light-dark()` — the console had
+  no dark mode at all before.
+- Layout follows Astryx's "Console / observability" app archetype:
+  TopNav, Card grid for the fleet dashboard widgets, dense rows
+  (Table/List) for the sessions table and event log, a 3-pane tool
+  frame (endpoint list | form | response) for the playground.
+- All Handlebars template logic and class names kept as-is — this is
+  a CSS + minor-markup change, not a rewrite; every existing feature
+  (tags, blast, scheduled, search, export/import, media — all the
+  tabs added this session) carried over unchanged.
+- Fixed a real bug found during visual review: the live-events panel
+  let long JSON messages overflow past the card edge (a classic CSS
+  Grid `min-width: auto` blowout) — now wraps inside the card.
+- Verified with real screenshots (Playwright + a locally-installed
+  headless Chromium — the only way to actually see a CSS change
+  rather than assume it worked), light and dark, overview and
+  playground.
+
+### Fixed — Swagger UI / OpenAPI spec were unauthenticated
+
+`/swagger-ui` and `/api-docs` (the OpenAPI JSON) bypassed the auth
+middleware entirely — anyone who found the URL could browse the full
+API surface with no credentials. They now go through the same check
+as every other protected route: a `SUPERADMIN_TOKEN` bearer header,
+a superadmin JWT, or (for a human in a browser) the `waxum_console`
+cookie from an existing console login — so a signed-in operator lands
+on the docs with no extra prompt, and nobody else gets past a 401.
+
 ## [0.9.4] - 2026-07-24
 
 ### Fixed — console playground GET requests silently dropped query params

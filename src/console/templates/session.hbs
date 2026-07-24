@@ -28,7 +28,7 @@
       <div class="session-meta">
         <span class="status-pill {{status_class}}"><span class="status-dot"></span>{{status_label}}</span>
         {{#if phone}}<span class="phone mono">{{phone}}</span>{{/if}}
-        <span class="mono" style="color:var(--mist)">{{storage_path}}</span>
+        <span class="mono" style="color:var(--color-text-secondary)">{{storage_path}}</span>
       </div>
     </div>
   </section>
@@ -95,7 +95,7 @@
           <span class="panel-title">Response</span>
           <span class="panel-serial mono" id="pg-result-status">—</span>
         </header>
-        <pre id="pg-result-body" class="pg-result-body"><span style="color:var(--mist)">No request sent yet.</span></pre>
+        <pre id="pg-result-body" class="pg-result-body"><span style="color:var(--color-text-secondary)">No request sent yet.</span></pre>
       </div>
     </section>
   </div>
@@ -287,7 +287,7 @@
     const missing = missingRequiredFields(values);
     if (missing.length) {
       resStatusEl.textContent = 'ERROR';
-      resStatusEl.style.color = 'var(--sakura)';
+      resStatusEl.style.color = 'var(--color-error)';
       resBodyEl.textContent = 'Missing required field(s): ' + missing.join(', ');
       return;
     }
@@ -320,12 +320,12 @@
       let pretty = text;
       try { parsed = JSON.parse(text); pretty = JSON.stringify(parsed, null, 2); } catch (e) { /* not JSON */ }
       resStatusEl.textContent = res.status + ' ' + res.statusText;
-      resStatusEl.style.color = res.ok ? 'var(--jade-deep)' : 'var(--sakura)';
+      resStatusEl.style.color = res.ok ? 'var(--color-text-accent)' : 'var(--color-error)';
       resBodyEl.textContent = pretty;
       renderRecordingPlayer(parsed);
     } catch (e) {
       resStatusEl.textContent = 'NETWORK';
-      resStatusEl.style.color = 'var(--sakura)';
+      resStatusEl.style.color = 'var(--color-error)';
       resBodyEl.textContent = String(e);
     }
   }
