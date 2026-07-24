@@ -182,6 +182,9 @@
           o.value = opt; o.textContent = opt;
           input.appendChild(o);
         });
+      } else if (f.type === 'file') {
+        input = document.createElement('input');
+        input.type = 'file';
       } else if (f.type === 'checkbox') {
         input = document.createElement('input');
         input.type = 'checkbox';
@@ -220,6 +223,7 @@
     formEl.querySelectorAll('input, textarea, select').forEach(el => {
       const t = el.dataset.type;
       if (t === 'checkbox') values[el.name] = el.checked;
+      else if (t === 'file') values[el.name] = el.files && el.files[0] ? el.files[0] : null;
       else if (t === 'number') values[el.name] = el.value === '' ? null : Number(el.value);
       else if (t === 'json') {
         if (el.value.trim()) {
@@ -253,6 +257,22 @@
     return out;
   }
 
+  function missingRequiredFields(values) {
+    return activeEndpoint.fields
+      .filter(f => f.required && (values[f.name] === undefined || values[f.name] === null || values[f.name] === ''))
+      .map(f => f.label);
+  }
+
+  function appendQuery(path, body) {
+    const qs = new URLSearchParams();
+    Object.keys(body).forEach(k => {
+      const v = body[k];
+      qs.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
+    });
+    const query = qs.toString();
+    return query ? path + (path.includes('?') ? '&' : '?') + query : path;
+  }
+
   async function submit() {
     resStatusEl.textContent = 'Sending…';
     resBodyEl.textContent = '';
@@ -264,7 +284,15 @@
       return;
     }
 
-    const path = buildPath(values);
+    const missing = missingRequiredFields(values);
+    if (missing.length) {
+      resStatusEl.textContent = 'ERROR';
+      resStatusEl.style.color = 'var(--sakura)';
+      resBodyEl.textContent = 'Missing required field(s): ' + missing.join(', ');
+      return;
+    }
+
+    let path = buildPath(values);
     const body = stripPathFields(values);
     const method = activeEndpoint.method;
 
@@ -273,11 +301,14 @@
       credentials: 'same-origin',
       headers: {},
     };
-    if (method !== 'GET' && method !== 'DELETE' && Object.keys(body).length) {
-      opts.headers['content-type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    if ((method === 'DELETE') && Object.keys(body).length) {
+    const hasFile = activeEndpoint.fields.some(f => f.type === 'file');
+    if (method === 'GET') {
+      path = appendQuery(path, body);
+    } else if (hasFile) {
+      const form = new FormData();
+      Object.keys(body).forEach(k => form.append(k, body[k]));
+      opts.body = form;
+    } else if (Object.keys(body).length) {
       opts.headers['content-type'] = 'application/json';
       opts.body = JSON.stringify(body);
     }

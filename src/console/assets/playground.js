@@ -15,6 +15,16 @@
 (function () {
   const R = (group, ...items) => items.map((x) => ({ group, ...x }));
 
+  // Every send endpoint accepts an optional `send_at` (ISO-8601 UTC) to
+  // park the message instead of sending immediately — see docs/api/scheduled.md.
+  // Appended here instead of repeating it on all 30+ send entries below.
+  const SEND_AT_FIELD = {
+    name: 'send_at', label: 'Send at (ISO-8601 UTC, optional)', type: 'text',
+    placeholder: '2026-08-01T09:00:00Z',
+  };
+  const withSendAt = (items) =>
+    items.map((x) => ({ ...x, fields: [...x.fields, SEND_AT_FIELD] }));
+
   window.__ENDPOINTS__ = [
     // ---------- info & pair ----------
     ...R('info',
@@ -36,10 +46,17 @@
         path: '/api/v1/sessions/{sid}/device', fields: [] },
       { key: 'delete', label: 'Delete session (logout + purge)', method: 'DELETE',
         path: '/api/v1/sessions/{sid}', fields: [], danger: true },
+      { key: 'export', label: 'Export session (zip, disconnects first)', method: 'POST',
+        path: '/api/v1/sessions/{sid}/export', fields: [], danger: true },
+      { key: 'import', label: 'Import session (restore from export zip)', method: 'POST',
+        path: '/api/v1/sessions/{sid}/import',
+        fields: [
+          { name: 'file', label: 'Exported .zip', type: 'file', required: true },
+        ] },
     ),
 
     // ---------- send ----------
-    ...R('send',
+    ...withSendAt(R('send',
       { key: 'text', label: 'Text message', method: 'POST',
         path: '/api/v1/sessions/{sid}/messages/text',
         fields: [
@@ -147,7 +164,7 @@
           { name: 'vcard', label: 'vCard body', type: 'textarea', required: true,
             placeholder: 'BEGIN:VCARD\\nVERSION:3.0\\n…' },
         ] },
-    ),
+    )),
 
     // ---------- chat ----------
     ...R('chat',
@@ -397,6 +414,114 @@
         ] },
     ),
 
+    // ---------- search ----------
+    ...R('search',
+      { key: 'session', label: 'Search this session\'s messages', method: 'GET',
+        path: '/api/v1/sessions/{sid}/messages/search',
+        fields: [
+          { name: 'q', label: 'Query', type: 'text', required: true, placeholder: 'lunch' },
+          { name: 'limit', label: 'Limit', type: 'number', default: 20 },
+          { name: 'offset', label: 'Offset', type: 'number', default: 0 },
+        ] },
+      { key: 'fleet', label: 'Search all sessions\' messages', method: 'GET',
+        path: '/api/v1/messages/search',
+        fields: [
+          { name: 'q', label: 'Query', type: 'text', required: true, placeholder: 'lunch' },
+          { name: 'session', label: 'Restrict to session id (optional)', type: 'text' },
+          { name: 'limit', label: 'Limit', type: 'number', default: 20 },
+          { name: 'offset', label: 'Offset', type: 'number', default: 0 },
+        ] },
+    ),
+
+    // ---------- scheduled send ----------
+    ...R('scheduled',
+      { key: 'list-session', label: 'List this session\'s scheduled sends', method: 'GET',
+        path: '/api/v1/sessions/{sid}/scheduled',
+        fields: [
+          { name: 'status', label: 'Status filter (pending/sending/sent/failed/cancelled)', type: 'text' },
+        ] },
+      { key: 'list-fleet', label: 'List all scheduled sends', method: 'GET',
+        path: '/api/v1/scheduled',
+        fields: [
+          { name: 'session', label: 'Session id (optional)', type: 'text' },
+          { name: 'status', label: 'Status filter', type: 'text' },
+        ] },
+      { key: 'cancel', label: 'Cancel a scheduled send', method: 'DELETE',
+        path: '/api/v1/sessions/{sid}/scheduled/{id}',
+        fields: [{ name: 'id', label: 'Schedule ID', type: 'text', required: true, in_path: true }] },
+    ),
+
+    // ---------- blast queue ----------
+    ...R('blast',
+      { key: 'create', label: 'Create blast job', method: 'POST',
+        path: '/api/v1/sessions/{sid}/blast',
+        fields: [
+          { name: 'endpoint', label: 'Send endpoint key (text, image, cta-url, ...)', type: 'text', required: true, default: 'text' },
+          { name: 'body', label: 'Request body (JSON, matches the endpoint\'s own fields)', type: 'json', required: true,
+            placeholder: '{"text":"Hello!"}' },
+          { name: 'recipients', label: 'Recipients (JSON array)', type: 'json', required: true,
+            placeholder: '["628123456789","628987654321"]' },
+          { name: 'delay_ms', label: 'Delay between sends (ms, default 1000)', type: 'number' },
+          { name: 'jitter_ms', label: 'Random jitter (ms, default 0)', type: 'number' },
+          { name: 'max_attempts', label: 'Max attempts before DLQ (default 3)', type: 'number' },
+          { name: 'dedup_across_jobs', label: 'Skip recipients already sent in a prior job', type: 'checkbox' },
+          { name: 'send_at', label: 'Delayed start (ISO-8601 UTC, optional)', type: 'text' },
+        ] },
+      { key: 'list-session', label: 'List this session\'s blast jobs', method: 'GET',
+        path: '/api/v1/sessions/{sid}/blasts', fields: [] },
+      { key: 'list-fleet', label: 'List all blast jobs', method: 'GET',
+        path: '/api/v1/blasts', fields: [] },
+      { key: 'get', label: 'Get blast job', method: 'GET',
+        path: '/api/v1/sessions/{sid}/blasts/{id}',
+        fields: [{ name: 'id', label: 'Blast ID', type: 'text', required: true, in_path: true }] },
+      { key: 'recipients', label: 'List blast recipients', method: 'GET',
+        path: '/api/v1/sessions/{sid}/blasts/{id}/recipients',
+        fields: [{ name: 'id', label: 'Blast ID', type: 'text', required: true, in_path: true }] },
+      { key: 'cancel', label: 'Cancel blast job', method: 'POST',
+        path: '/api/v1/sessions/{sid}/blasts/{id}/cancel',
+        fields: [{ name: 'id', label: 'Blast ID', type: 'text', required: true, in_path: true }], danger: true },
+      { key: 'retry', label: 'Retry failed recipients', method: 'POST',
+        path: '/api/v1/sessions/{sid}/blasts/{id}/retry',
+        fields: [{ name: 'id', label: 'Blast ID', type: 'text', required: true, in_path: true }] },
+    ),
+
+    // ---------- session tags ----------
+    ...R('tags',
+      { key: 'list', label: 'List this session\'s tags', method: 'GET',
+        path: '/api/v1/sessions/{sid}/tags', fields: [] },
+      { key: 'add', label: 'Add a tag', method: 'POST',
+        path: '/api/v1/sessions/{sid}/tags',
+        fields: [{ name: 'tag', label: 'Tag', type: 'text', required: true }] },
+      { key: 'replace', label: 'Replace all tags', method: 'PUT',
+        path: '/api/v1/sessions/{sid}/tags',
+        fields: [{ name: 'tags', label: 'Tags (JSON array)', type: 'json', required: true, placeholder: '["vip","jakarta"]' }] },
+      { key: 'remove', label: 'Remove a tag', method: 'DELETE',
+        path: '/api/v1/sessions/{sid}/tags/{tag}',
+        fields: [{ name: 'tag', label: 'Tag', type: 'text', required: true, in_path: true }] },
+      { key: 'list-all', label: 'List all tags fleet-wide (with counts)', method: 'GET',
+        path: '/api/v1/tags', fields: [] },
+    ),
+
+    // ---------- media ----------
+    ...R('media',
+      { key: 'upload', label: 'Upload media (returns url/media_key for send)', method: 'POST',
+        path: '/api/v1/sessions/{sid}/media/upload',
+        fields: [
+          { name: 'file', label: 'File', type: 'file', required: true },
+          { name: 'media_type', label: 'Media type (image/video/audio/document/sticker)', type: 'text', required: true, default: 'image' },
+        ] },
+      { key: 'download', label: 'Download media (base64)', method: 'POST',
+        path: '/api/v1/sessions/{sid}/media/download',
+        fields: [
+          { name: 'direct_path', label: 'direct_path', type: 'text', required: true },
+          { name: 'media_key', label: 'media_key (base64)', type: 'text', required: true },
+          { name: 'file_sha256', label: 'file_sha256 (base64)', type: 'text', required: true },
+          { name: 'file_enc_sha256', label: 'file_enc_sha256 (base64)', type: 'text', required: true },
+          { name: 'file_length', label: 'file_length', type: 'number', required: true },
+          { name: 'media_type', label: 'Media type', type: 'text', required: true, default: 'image' },
+        ] },
+    ),
+
     // ---------- fleet (cross-session ops) ----------
     ...R('fleet',
       { key: 'stats', label: 'Fleet stats', method: 'GET',
@@ -421,15 +546,20 @@
   ];
 
   window.__GROUP_META__ = {
-    info:     { title: 'Info & Pair',   icon: 'i-power' },
-    send:     { title: 'Send',          icon: 'i-arrow' },
-    chat:     { title: 'Chat',          icon: 'i-book' },
-    contacts: { title: 'Contacts',      icon: 'i-book' },
-    groups:   { title: 'Groups',        icon: 'i-book' },
-    calls:    { title: 'Calls',         icon: 'i-signal' },
-    blocking: { title: 'Blocking',      icon: 'i-x' },
-    webhooks: { title: 'Webhooks',      icon: 'i-refresh' },
-    ops:      { title: 'Operations',    icon: 'i-refresh' },
-    fleet:    { title: 'Fleet',         icon: 'i-signal' },
+    info:      { title: 'Info & Pair',   icon: 'i-power' },
+    send:      { title: 'Send',          icon: 'i-arrow' },
+    chat:      { title: 'Chat',          icon: 'i-book' },
+    contacts:  { title: 'Contacts',      icon: 'i-book' },
+    groups:    { title: 'Groups',        icon: 'i-book' },
+    calls:     { title: 'Calls',         icon: 'i-signal' },
+    blocking:  { title: 'Blocking',      icon: 'i-x' },
+    webhooks:  { title: 'Webhooks',      icon: 'i-refresh' },
+    ops:       { title: 'Operations',    icon: 'i-refresh' },
+    search:    { title: 'Search',        icon: 'i-book' },
+    scheduled: { title: 'Scheduled',     icon: 'i-refresh' },
+    blast:     { title: 'Blast',         icon: 'i-signal' },
+    tags:      { title: 'Tags',          icon: 'i-plus' },
+    media:     { title: 'Media',         icon: 'i-book' },
+    fleet:     { title: 'Fleet',         icon: 'i-signal' },
   };
 })();

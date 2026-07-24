@@ -2,6 +2,46 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.4] - 2026-07-24
+
+### Fixed — console playground GET requests silently dropped query params
+
+The playground's generic request builder computed non-path field
+values for every method, but only ever attached them to the request
+as a JSON body — for `GET` requests that body was built and then
+discarded, so any GET endpoint with query parameters (e.g. `Search
+sessions`, `q` field marked required) always fired with an empty
+query string. The server correctly rejected it: `Failed to
+deserialize query string: missing field 'q'`. Now GET requests
+serialize their fields into the URL query string via
+`URLSearchParams` instead.
+
+Also added, while auditing the playground for other gaps:
+
+- **Required-field validation** — missing required fields now show a
+  friendly inline error before the request fires, instead of always
+  sending a request the server was going to reject anyway.
+- **File upload support** (`type: 'file'`, multipart `FormData`) — the
+  form builder had no way to attach a file at all. Used by two newly
+  added endpoints below.
+- **`send_at` on every send endpoint** — the scheduling field
+  existed in the API but was never exposed in the console; every
+  entry in the Send tab now carries it.
+- **New tabs**: Search (session + fleet-wide message search), Scheduled
+  (list/cancel scheduled sends), Blast (create/list/get/recipients/
+  cancel/retry), Tags (list/add/replace/remove/fleet list), Media
+  (upload/download) — none of these existed in the console before,
+  despite being in the REST API since v0.7.13-0.9.3.
+- Session **Export** / **Import** added to the Info tab.
+
+Verified against a real running server + curl: reproduced the exact
+reported error (GET with no query string → 400 missing field `q`),
+confirmed it resolves once `q` is a real query parameter (200, valid
+response). Full interactive browser testing wasn't possible in this
+environment (no browser or Node.js available) — the request-building
+and validation logic was additionally checked via static analysis
+(bracket/paren balance, manual trace of `submit()`).
+
 ## [0.9.3] - 2026-07-24
 
 ### Added — session export/import between instances
