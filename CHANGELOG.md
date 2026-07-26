@@ -2,6 +2,31 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.7] - 2026-07-26
+
+### Changed — bump vendored `whatsapp-rust` (449 commits)
+
+Synced the pinned `whatsapp-rust` / `wacore` / `waproto` rev (and the
+local vendored clone in the workspace) from `0077186` to `dde51e7`,
+449 commits of upstream fixes and perf work — notably a socket fix
+that stops resending after a transport failure instead of reusing
+the nonce, and several VoIP relay/device races. Picked up three
+breaking renames and migrated call sites accordingly, all
+behavior-preserving:
+
+- `Client::get_push_name()` / `get_pn()` / `get_lid()` renamed to
+  `push_name()` / `pn()` / `lid()` — same signatures, straight
+  rename.
+- `GroupCreateOptions::with_membership_approval_mode()` builder
+  method was dropped; the field itself (`membership_approval_mode`)
+  is still public, so call sites now assign it directly.
+- `Groups::set_description()`'s third parameter changed from
+  `Option<&str>` to the new `PreviousDescription` enum. Verified
+  against the previous implementation that a bare `None` used to
+  mean "send no token" — `PreviousDescription::Absent`, exactly what
+  the `From<Option<&str>>` conversion produces, so `.into()` at the
+  call site preserves the old behavior exactly.
+
 ## [0.9.6] - 2026-07-24
 
 ### Changed — session detail page cleanup

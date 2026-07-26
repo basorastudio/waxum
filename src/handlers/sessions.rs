@@ -831,14 +831,14 @@ pub async fn get_device_info(
 
     let client = runtime.get_client().ok_or(ApiError::NotConnected)?;
 
-    let push_name_str = client.get_push_name();
+    let push_name_str = client.push_name();
     let push_name = if push_name_str.is_empty() {
         None
     } else {
         Some(push_name_str)
     };
-    let pn = client.get_pn().map(|j| j.to_string());
-    let lid = client.get_lid().map(|j| j.to_string());
+    let pn = client.pn().map(|j| j.to_string());
+    let lid = client.lid().map(|j| j.to_string());
 
     Ok(Json(DeviceInfo {
         device_id: None,
@@ -1145,13 +1145,13 @@ async fn handle_event(
             runtime.set_pair_code(None);
             runtime.clear_pair_state();
 
-            let push_name_str = client.get_push_name();
+            let push_name_str = client.push_name();
             let push_name = if push_name_str.is_empty() {
                 None
             } else {
                 Some(push_name_str)
             };
-            let phone = client.get_pn().map(|j| j.user.clone());
+            let phone = client.pn().map(|j| j.user.clone());
 
             let _ = state
                 .session_manager()
