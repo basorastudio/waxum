@@ -5193,7 +5193,7 @@ dependencies = [
 
 [[package]]
 name = "waxum"
-version = "0.9.3"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "async-channel",
