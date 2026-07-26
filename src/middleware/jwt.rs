@@ -7,8 +7,11 @@
 //! - a JWT signed with `JWT_SECRET` whose `role` claim is `superadmin`.
 //!
 //! `/health` and `/metrics` are always allowed through so probes and
-//! scrapers don't need credentials. `/swagger-ui` and `/api-docs` are also
-//! exempt so the interactive docs can render without auth.
+//! scrapers don't need credentials. `/swagger-ui` and `/api-docs` go
+//! through the same check as everything else — either header carries the
+//! plain `SUPERADMIN_TOKEN` (or a superadmin JWT), or the browser already
+//! holds the `waxum_console` cookie from a console login, so a signed-in
+//! operator lands straight on the docs with no separate prompt.
 
 use axum::{
     body::Body,
@@ -97,12 +100,6 @@ impl JwtAuth {
 pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
     if matches!(path, "/health" | "/livez" | "/readyz" | "/metrics") {
-        return next.run(request).await;
-    }
-
-    if request.uri().path().starts_with("/swagger-ui")
-        || request.uri().path().starts_with("/api-docs")
-    {
         return next.run(request).await;
     }
 

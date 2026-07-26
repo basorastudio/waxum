@@ -2,6 +2,170 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.6] - 2026-07-24
+
+### Changed — session detail page cleanup
+
+Follow-up polish pass on the session detail page after feedback that
+it "felt unprofessional" — four concrete issues, fixed:
+
+- The session's raw filesystem storage path (an absolute local disk
+  path, e.g. `/var/.../sessions/<id>`) was dumped as plain text under
+  the session title. It's operator-only debug info, not something a
+  console visitor needs to see — removed from the header.
+- The old "PANEL.00" / "PANEL.01" / "PANEL.02" / "PANEL.03" fake
+  serial-number labels (leftovers from the earlier redesign's
+  hardware-panel aesthetic) are gone site-wide. Two were replaced
+  with actually useful counts (total sessions, endpoint count); the
+  rest were just noise.
+- The "Pair session" panel had a large unbalanced empty gap under the
+  phone-pairing column versus the QR column. Fixed the alignment
+  (`align-items: center` instead of `start`, dropped a hardcoded
+  `padding-top: 90px` hack) and added a short explanatory caption
+  under "Request pair code" so both columns carry a similar amount of
+  content.
+- The playground's endpoint browser — a horizontal pill-tab row above
+  a 3-pane grid — is now a single collapsible sidebar tree (grouped,
+  expand/collapse per group, ~90 endpoints across 15 groups) next to
+  a 2-pane form/response layout, closer to Postman/Insomnia than the
+  old tab bar. Scales better as more endpoint groups get added.
+- Verified with fresh Playwright screenshots, light and dark, overview
+  and session detail (including an expanded group + loaded form).
+
+## [0.9.5] - 2026-07-24
+
+### Changed — console redesign
+
+Full visual pass on the console (fleet overview, session detail,
+playground, login), replacing the old hard-shadow/halftone look with
+design tokens hand-copied from [Astryx](https://www.npmjs.com/package/@astryxdesign/core)
+(Meta's open-source design system) — colors, spacing, radius, shadow,
+and type scale, applied to the existing server-rendered
+Handlebars/vanilla-CSS console with **no new build step or JS
+framework**: no React, no Bun bundling, nothing added to the binary's
+build requirements. `console.css` is a hand-written implementation of
+Astryx's neutral theme values, not a package import.
+
+- Dark mode, automatically, via CSS `light-dark()` — the console had
+  no dark mode at all before.
+- Layout follows Astryx's "Console / observability" app archetype:
+  TopNav, Card grid for the fleet dashboard widgets, dense rows
+  (Table/List) for the sessions table and event log, a 3-pane tool
+  frame (endpoint list | form | response) for the playground.
+- All Handlebars template logic and class names kept as-is — this is
+  a CSS + minor-markup change, not a rewrite; every existing feature
+  (tags, blast, scheduled, search, export/import, media — all the
+  tabs added this session) carried over unchanged.
+- Fixed a real bug found during visual review: the live-events panel
+  let long JSON messages overflow past the card edge (a classic CSS
+  Grid `min-width: auto` blowout) — now wraps inside the card.
+- Verified with real screenshots (Playwright + a locally-installed
+  headless Chromium — the only way to actually see a CSS change
+  rather than assume it worked), light and dark, overview and
+  playground.
+
+### Fixed — Swagger UI / OpenAPI spec were unauthenticated
+
+`/swagger-ui` and `/api-docs` (the OpenAPI JSON) bypassed the auth
+middleware entirely — anyone who found the URL could browse the full
+API surface with no credentials. They now go through the same check
+as every other protected route: a `SUPERADMIN_TOKEN` bearer header,
+a superadmin JWT, or (for a human in a browser) the `waxum_console`
+cookie from an existing console login — so a signed-in operator lands
+on the docs with no extra prompt, and nobody else gets past a 401.
+
+## [0.9.4] - 2026-07-24
+
+### Fixed — console playground GET requests silently dropped query params
+
+The playground's generic request builder computed non-path field
+values for every method, but only ever attached them to the request
+as a JSON body — for `GET` requests that body was built and then
+discarded, so any GET endpoint with query parameters (e.g. `Search
+sessions`, `q` field marked required) always fired with an empty
+query string. The server correctly rejected it: `Failed to
+deserialize query string: missing field 'q'`. Now GET requests
+serialize their fields into the URL query string via
+`URLSearchParams` instead.
+
+Also added, while auditing the playground for other gaps:
+
+- **Required-field validation** — missing required fields now show a
+  friendly inline error before the request fires, instead of always
+  sending a request the server was going to reject anyway.
+- **File upload support** (`type: 'file'`, multipart `FormData`) — the
+  form builder had no way to attach a file at all. Used by two newly
+  added endpoints below.
+- **`send_at` on every send endpoint** — the scheduling field
+  existed in the API but was never exposed in the console; every
+  entry in the Send tab now carries it.
+- **New tabs**: Search (session + fleet-wide message search), Scheduled
+  (list/cancel scheduled sends), Blast (create/list/get/recipients/
+  cancel/retry), Tags (list/add/replace/remove/fleet list), Media
+  (upload/download) — none of these existed in the console before,
+  despite being in the REST API since v0.7.13-0.9.3.
+- Session **Export** / **Import** added to the Info tab.
+
+Verified against a real running server + curl: reproduced the exact
+reported error (GET with no query string → 400 missing field `q`),
+confirmed it resolves once `q` is a real query parameter (200, valid
+response). Full interactive browser testing wasn't possible in this
+environment (no browser or Node.js available) — the request-building
+and validation logic was additionally checked via static analysis
+(bracket/paren balance, manual trace of `submit()`).
+
+## [0.9.3] - 2026-07-24
+
+### Added — session export/import between instances
+
+- `POST /sessions/{id}/export` — disconnects the session (device
+  credentials must never be live on two instances at once), zips its
+  local storage directory (device identity, Signal protocol keys,
+  noise handshake state — everything `whatsapp-rust` itself persists
+  per session), and streams the archive back.
+- `POST /sessions/{id}/import` — accepts that archive on another
+  instance (or the same one) and restores it into place. Refuses to
+  run over a currently-connected session. Does not auto-reconnect —
+  call `/connect` afterwards.
+- Scope note: `whatsapp-rust`'s only storage backend is local SQLite
+  files (`storages/sqlite-storage`, no Postgres/MySQL option), so a
+  session's live client state is inherently pinned to one instance's
+  disk. True transparent multi-instance session ownership would need
+  a networked storage backend written against `wacore::store::traits`
+  upstream — a separate, much larger project. This is the practical
+  middle ground: explicit, operator-triggered migration.
+- Also fixed: a real phone number had leaked into example values
+  across the API docs, Swagger schema, and console playground UI —
+  replaced with the generic placeholder used everywhere else.
+
+### Changed
+
+- README: removed the separate "Roadmap / on-going" table — shipped
+  items are already listed in their feature tables, and the two
+  genuinely-not-planned items (group voice calls, encryption at rest)
+  moved to a short "Known limitations" note explaining why, instead
+  of sitting in a wishlist.
+
+## [0.9.2] - 2026-07-24
+
+### Added — S3 backend for call recordings
+
+- Call recordings can now live in S3-compatible object storage (AWS
+  S3, MinIO, R2, Wasabi, …) instead of local disk. Set `S3_BUCKET`
+  (plus `S3_ENDPOINT`, `S3_REGION`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`) to switch; omit it and recordings keep
+  writing to `WHATSAPP_STORAGE_PATH` as before. A connection failure
+  at startup logs an error and falls back to local disk rather than
+  aborting the process, matching how NATS is wired up.
+- New `src/storage.rs`, pulled in via the `s3` crate — pure Rust,
+  rustls by default, no native TLS/OpenSSL and no C build step (kept
+  in mind after the whisper-rs incident in 0.9.0/0.9.1).
+- Scope note: this only covers recordings. Message media (images,
+  video, documents) was never persisted to local disk in the first
+  place — it streams straight through to WhatsApp's own CDN via
+  `client.upload`/`download_from_params` — so there was nothing else
+  under "media" to back with S3.
+
 ## [0.9.1] - 2026-07-24
 
 `v0.9.0`'s tag exists but was never actually released — its build

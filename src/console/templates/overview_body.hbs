@@ -26,7 +26,7 @@
   <article class="panel">
     <header class="panel-head">
       <span class="panel-title">Sessions</span>
-      <span class="panel-serial">PANEL.01</span>
+      {{#if has_sessions}}<span class="panel-serial">{{sessions_count}} total</span>{{/if}}
     </header>
     <div class="panel-body">
       {{#if has_sessions}}
@@ -43,7 +43,7 @@
         {{#each sessions}}
           <tr onclick="location.href='/s/'+encodeURIComponent('{{id}}')">
             <td class="id">{{id}}</td>
-            <td class="phone">{{#if phone}}{{phone}}{{else}}<span style="color:var(--ash)">—</span>{{/if}}</td>
+            <td class="phone">{{#if phone}}{{phone}}{{else}}<span style="color:var(--color-border)">—</span>{{/if}}</td>
             <td>
               <span class="status-pill {{status_class}}">
                 <span class="status-dot"></span>
@@ -73,8 +73,7 @@
       {{/if}}
     </div>
     {{#if has_sessions}}
-    <div style="padding:14px 20px;border-top:1px dashed var(--ash);display:flex;justify-content:space-between;align-items:center">
-      <span class="panel-serial">{{sessions_count}} TOTAL</span>
+    <div style="padding:14px 20px;border-top:1px solid var(--color-border);display:flex;justify-content:flex-end;align-items:center">
       <button class="btn primary" onclick="createSession()">
         <svg class="icon sm"><use href="#i-plus"/></svg>
         New session
@@ -86,7 +85,6 @@
   <article class="panel">
     <header class="panel-head">
       <span class="panel-title">Live events</span>
-      <span class="panel-serial">PANEL.02</span>
     </header>
     <div class="events">
       {{#if has_events}}
