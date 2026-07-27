@@ -1244,7 +1244,8 @@ async fn handle_event(
         for im in batch.messages.iter() {
             crate::handlers::search::record_incoming(state, session_id, &im.message, &im.info)
                 .await;
-            let data = message_event_data(&im.message, &im.info);
+            let from_phone = resolve_sender_phone(&client, &im.info.source.sender).await;
+            let data = message_event_data(&im.message, &im.info, from_phone);
             let payload_value = serde_json::json!({
                 "session_id": session_id,
                 "event": "message",
@@ -1408,12 +1409,14 @@ fn extract_location(msg: &waproto::whatsapp::Message) -> serde_json::Value {
 fn message_event_data(
     msg: &waproto::whatsapp::Message,
     info: &wacore::types::message::MessageInfo,
+    from_phone: Option<String>,
 ) -> serde_json::Value {
     let (text, caption, message_type, media_mimetype) = extract_message_content(msg);
     let media_meta = extract_media_metadata(msg);
     let location = extract_location(msg);
     serde_json::json!({
         "from": info.source.sender.to_string(),
+        "from_phone": from_phone,
         "chat": info.source.chat.to_string(),
         "message_id": info.id.to_string(),
         "timestamp": info.timestamp,
@@ -1431,6 +1434,31 @@ fn message_event_data(
         "is_group": info.source.chat.to_string().ends_with("@g.us"),
         "participant": info.source.sender.to_string(),
     })
+}
+
+/// Resolves `sender` to its phone number for the `from_phone` webhook field.
+///
+/// A `@lid` sender is looked up in whatsapp-rust's own LID↔PN mapping cache
+/// (cache-aside over its persistent backend — no network round trip), which
+/// is populated from several passive sources including the `sender_pn`
+/// attribute WhatsApp attaches to incoming messages, so it is usually already
+/// warm by the time a message arrives. A plain-phone sender needs no lookup.
+async fn resolve_sender_phone(
+    client: &whatsapp_rust::Client,
+    sender: &wacore_binary::Jid,
+) -> Option<String> {
+    if sender.is_pn() {
+        return Some(sender.user.to_string());
+    }
+    if !sender.is_lid() {
+        return None;
+    }
+    client
+        .get_lid_pn_entry(sender)
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.phone_number.to_string())
 }
 
 /// Extracts user-visible content from a protobuf Message: best-effort text,
@@ -1666,7 +1694,7 @@ fn event_to_json(event: &wacore::types::events::Event, session_id: &str) -> serd
 
     let data = match event {
         Event::Messages(batch) => match batch.first() {
-            Some(im) => message_event_data(&im.message, &im.info),
+            Some(im) => message_event_data(&im.message, &im.info, None),
             None => serde_json::json!({}),
         },
         Event::Receipt(receipt) => {

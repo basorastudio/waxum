@@ -2,6 +2,37 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.9.8] - 2026-07-26
+
+### Added — resolved phone number in message webhooks (`from_phone`)
+
+WhatsApp's LID-only privacy addressing means the `message` webhook's
+`from` field is often a `12300954140784@lid` value instead of a phone
+number, with no way to turn it back into one — support fielded this
+exact confusion this week (someone conflated it with the *send-side*
+[LID auto-resolve](https://waxum.imtaqin.id/docs/api/messages#lid-auto-resolve),
+which only affects outbound `/messages/*` calls and has no bearing on
+inbound webhooks).
+
+The `message` event payload now carries a `from_phone` field
+alongside `from`:
+
+- Plain-phone senders: `from_phone` mirrors `from`'s number, no
+  lookup needed.
+- `@lid` senders: resolved via `Client::get_lid_pn_entry`, a
+  cache-aside lookup over whatsapp-rust's own passively-learned
+  LID↔phone mapping (usync, message sender attributes, history sync,
+  etc.) — no extra network round trip on waxum's side, and usually
+  already warm for any contact that has messaged before.
+- Unresolved: `from_phone` is `null`. Real "not known yet" outcome
+  (typically a LID's very first message), not a bug — consumers
+  needing the phone number should handle it.
+
+Docs updated: `waxum-doc/docs/api/webhooks.md` documents the new
+field and the `from` vs `from_phone` distinction; a cross-reference
+warning was added to the LID auto-resolve section in `messages.md`
+clarifying it's send-side only.
+
 ## [0.9.7] - 2026-07-26
 
 ### Changed — bump vendored `whatsapp-rust` (449 commits)
