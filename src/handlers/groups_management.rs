@@ -44,7 +44,7 @@ pub async fn create_group(
     let mut options = GroupCreateOptions::new(&request.name).with_participants(participants);
 
     if let Some(mode) = request.membership_approval_mode {
-        options = options.with_membership_approval_mode(match mode {
+        options.membership_approval_mode = Some(match mode {
             crate::models::groups::MembershipApprovalMode::Off => {
                 whatsapp_rust::MembershipApprovalMode::Off
             }
@@ -162,7 +162,7 @@ pub async fn set_group_description(
 
     client
         .groups()
-        .set_description(&jid, description, request.prev_id.as_deref())
+        .set_description(&jid, description, request.prev_id.as_deref().into())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
