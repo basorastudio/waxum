@@ -128,7 +128,22 @@ async fn init_sqlite(pool: &crate::db::session::SqlitePool) -> anyhow::Result<()
                 UNIQUE (session_id, message_id) \
              ); \
              CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, msg_timestamp); \
-             CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(session_id, chat_jid);",
+             CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(session_id, chat_jid); \
+             CREATE TABLE IF NOT EXISTS tokens ( \
+                id TEXT PRIMARY KEY, \
+                name TEXT, \
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')), \
+                expires_at TEXT, \
+                revoked_at TEXT \
+             ); \
+             CREATE TABLE IF NOT EXISTS token_sessions ( \
+                token_id TEXT NOT NULL, \
+                session_id TEXT NOT NULL, \
+                PRIMARY KEY (token_id, session_id), \
+                FOREIGN KEY (token_id) REFERENCES tokens(id) ON DELETE CASCADE, \
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE \
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_token_sessions_session ON token_sessions(session_id);",
         )?;
         if let Err(e) = sqlite_raw::exec_batch(
             conn,
@@ -400,6 +415,39 @@ async fn init_postgres(pool: &deadpool_postgres::Pool) -> anyhow::Result<()> {
         )
         .await?;
 
+    client
+        .execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS tokens (
+                id VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ,
+                revoked_at TIMESTAMPTZ
+            )
+            "#,
+            &[],
+        )
+        .await?;
+    client
+        .execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS token_sessions (
+                token_id VARCHAR(255) NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+                session_id VARCHAR(255) NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                PRIMARY KEY (token_id, session_id)
+            )
+            "#,
+            &[],
+        )
+        .await?;
+    client
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_token_sessions_session ON token_sessions(session_id)",
+            &[],
+        )
+        .await?;
+
     Ok(())
 }
 
@@ -566,6 +614,32 @@ async fn init_mysql(pool: &mysql_async::Pool) -> anyhow::Result<()> {
             INDEX idx_messages_session_ts (session_id, msg_timestamp),
             INDEX idx_messages_chat (session_id, chat_jid),
             FULLTEXT INDEX ft_messages_body (body)
+        ) DEFAULT CHARSET=utf8mb4
+        "#,
+    )
+    .await?;
+
+    conn.query_drop(
+        r#"
+        CREATE TABLE IF NOT EXISTS tokens (
+            id VARCHAR(255) PRIMARY KEY,
+            name VARCHAR(255) NULL,
+            created_at VARCHAR(30) NOT NULL DEFAULT '1970-01-01 00:00:00',
+            expires_at VARCHAR(30) NULL,
+            revoked_at VARCHAR(30) NULL
+        ) DEFAULT CHARSET=utf8mb4
+        "#,
+    )
+    .await?;
+    conn.query_drop(
+        r#"
+        CREATE TABLE IF NOT EXISTS token_sessions (
+            token_id VARCHAR(255) NOT NULL,
+            session_id VARCHAR(255) NOT NULL,
+            PRIMARY KEY (token_id, session_id),
+            INDEX idx_token_sessions_session (session_id),
+            FOREIGN KEY (token_id) REFERENCES tokens(id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         ) DEFAULT CHARSET=utf8mb4
         "#,
     )

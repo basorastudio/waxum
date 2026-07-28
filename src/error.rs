@@ -52,6 +52,9 @@ pub enum ApiError {
     #[error("Webhook not found: {0}")]
     WebhookNotFound(String),
 
+    #[error("Token not found or already revoked: {0}")]
+    TokenNotFound(String),
+
     #[error("Rate limited")]
     RateLimited,
 
@@ -102,6 +105,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::WebhookAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             ApiError::WebhookNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::TokenNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::TemporaryBan(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),

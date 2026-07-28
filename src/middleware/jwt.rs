@@ -6,6 +6,13 @@
 //! - the plain-string `SUPERADMIN_TOKEN` (env), or
 //! - a JWT signed with `JWT_SECRET` whose `role` claim is `superadmin`.
 //!
+//! A token minted via `POST /api/v1/tokens` carries a `jti`; that gets
+//! looked up in the `tokens`/`token_sessions` tables (see
+//! [`crate::db::tokens`]) on every request to enforce revocation and
+//! session scope. Tokens without a `jti` -- `SUPERADMIN_TOKEN` and the
+//! unscoped JWT printed at boot -- skip that lookup entirely and reach
+//! every session, unchanged from before this existed.
+//!
 //! `/health` and `/metrics` are always allowed through so probes and
 //! scrapers don't need credentials. `/swagger-ui` and `/api-docs` go
 //! through the same check as everything else — either header carries the
@@ -15,7 +22,7 @@
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -26,6 +33,8 @@ use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::state::AppState;
 
 /// Process-local fallback signing secret, used only when `JWT_SECRET` is
 /// unset. Generated once per process from OS entropy rather than a fixed
@@ -54,15 +63,15 @@ pub struct Claims {
 
     pub iat: usize,
 
-    /// Restricts this token to a single `session_id`, checked in
-    /// [`jwt_auth_middleware`] against every `/api/v1/sessions/{session_id}/*`
-    /// request. `None` (the default for tokens minted before this field
+    /// Identifies this token's row in the `tokens` table (see
+    /// [`crate::db::tokens`]), checked on every request in
+    /// [`jwt_auth_middleware`] for revocation and session-scope
+    /// enforcement. `None` (the default for tokens issued before this field
     /// existed, and for the operator-wide `SUPERADMIN_TOKEN`/boot token) is
-    /// unrestricted -- unchanged, pre-existing behavior. `Some(id)` is how a
-    /// customer-facing token is handed out without also granting it every
-    /// *other* customer's session on the same instance.
+    /// unrestricted and skips the DB lookup entirely -- unchanged,
+    /// pre-existing behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub jti: Option<String>,
 }
 
 #[derive(Clone)]
@@ -92,7 +101,7 @@ impl JwtAuth {
         subject: &str,
         role: &str,
         expires_in_hours: i64,
-        session_id: Option<&str>,
+        jti: Option<&str>,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = chrono::Utc::now();
         let exp = (now + chrono::Duration::hours(expires_in_hours)).timestamp() as usize;
@@ -103,7 +112,7 @@ impl JwtAuth {
             role: role.to_string(),
             exp,
             iat,
-            session_id: session_id.map(|s| s.to_string()),
+            jti: jti.map(|s| s.to_string()),
         };
 
         encode(
@@ -139,7 +148,11 @@ fn peer_ip(request: &Request<Body>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response {
+pub async fn jwt_auth_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
     if matches!(path, "/health" | "/livez" | "/readyz" | "/metrics") {
         return next.run(request).await;
@@ -199,15 +212,31 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
                 return forbidden_response("Superadmin role required");
             }
 
-            if let Some(scope) = claims.session_id.as_deref() {
+            if let Some(jti) = claims.jti.as_deref() {
+                let store = crate::db::tokens::TokenStore::new(state.session_manager().pool());
+                let status = match store.status(jti).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(peer = %peer, path = %path, error = %e, "auth: token status lookup failed");
+                        return unauthorized_response("Token status lookup failed");
+                    }
+                };
+                let Some(status) = status else {
+                    tracing::warn!(peer = %peer, path = %path, jti = %jti, "auth: token has no matching record (revoked/deleted?)");
+                    return forbidden_response("Token is no longer valid");
+                };
+                if status.revoked {
+                    tracing::warn!(peer = %peer, path = %path, jti = %jti, "auth: revoked token used");
+                    return forbidden_response("Token has been revoked");
+                }
                 match session_id_from_path(path) {
-                    Some(requested) if requested == scope => {}
+                    Some(requested) if status.session_ids.iter().any(|s| s == requested) => {}
                     _ => {
                         tracing::warn!(
-                            peer = %peer, path = %path, scope = %scope,
-                            "auth: token scoped to a different session attempted cross-session access"
+                            peer = %peer, path = %path, jti = %jti,
+                            "auth: token attempted access outside its bound sessions"
                         );
-                        return forbidden_response("Token is scoped to a different session");
+                        return forbidden_response("Token is not authorized for this session");
                     }
                 }
             }

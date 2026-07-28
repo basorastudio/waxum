@@ -15,4 +15,5 @@ pub mod schedule;
 pub mod search;
 pub mod sessions;
 pub mod status;
+pub mod tokens;
 pub mod webhooks;

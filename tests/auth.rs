@@ -57,33 +57,73 @@ async fn probes_bypass_auth() {
     }
 }
 
-#[tokio::test]
-async fn issue_session_token_endpoint_returns_a_working_scoped_token() {
-    let h = Harness::new().await;
-    create_session(&h, "s-scope-a").await;
-
+/// Mints a token via `POST /api/v1/tokens` and returns `(id, token)`.
+async fn mint_token(h: &Harness, session_ids: &[&str], name: Option<&str>) -> (String, String) {
     let (status, body) = call(
         &h.app,
         req_json(
             Method::POST,
-            "/api/v1/sessions/s-scope-a/token",
+            "/api/v1/tokens",
             Some(TEST_TOKEN),
-            json!({}),
+            json!({"session_ids": session_ids, "name": name}),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body.get("session_id").and_then(|v| v.as_str()),
-        Some("s-scope-a")
-    );
+    assert_eq!(status, StatusCode::OK, "mint failed: {body:?}");
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("id field")
+        .to_string();
     let token = body
         .get("token")
         .and_then(|v| v.as_str())
-        .expect("token field");
+        .expect("token field")
+        .to_string();
+    (id, token)
+}
 
-    let (status, _) = call(&h.app, req_get("/api/v1/sessions/s-scope-a", Some(token))).await;
+#[tokio::test]
+async fn mint_token_endpoint_returns_a_working_scoped_token() {
+    let h = Harness::new().await;
+    create_session(&h, "s-scope-a").await;
+
+    let (_, token) = mint_token(&h, &["s-scope-a"], Some("mobile-app")).await;
+
+    let (status, _) = call(&h.app, req_get("/api/v1/sessions/s-scope-a", Some(&token))).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn mint_token_rejects_empty_session_ids() {
+    let h = Harness::new().await;
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/tokens",
+            Some(TEST_TOKEN),
+            json!({"session_ids": []}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mint_token_rejects_unknown_session() {
+    let h = Harness::new().await;
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/tokens",
+            Some(TEST_TOKEN),
+            json!({"session_ids": ["does-not-exist"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -92,10 +132,7 @@ async fn scoped_token_cannot_reach_a_different_session() {
     create_session(&h, "s-scope-mine").await;
     create_session(&h, "s-scope-other").await;
 
-    let jwt = JwtAuth::with_secret(TEST_JWT_SECRET.to_string());
-    let token = jwt
-        .generate_token("s-scope-mine", "superadmin", 1, Some("s-scope-mine"))
-        .expect("generate scoped token");
+    let (_, token) = mint_token(&h, &["s-scope-mine"], None).await;
 
     let (status, _) = call(
         &h.app,
@@ -117,16 +154,38 @@ async fn scoped_token_cannot_reach_a_different_session() {
 }
 
 #[tokio::test]
+async fn token_can_be_scoped_to_multiple_sessions() {
+    let h = Harness::new().await;
+    create_session(&h, "s-multi-a").await;
+    create_session(&h, "s-multi-b").await;
+    create_session(&h, "s-multi-c").await;
+
+    let (_, token) = mint_token(&h, &["s-multi-a", "s-multi-b"], None).await;
+
+    for id in ["s-multi-a", "s-multi-b"] {
+        let (status, _) = call(
+            &h.app,
+            req_get(&format!("/api/v1/sessions/{id}"), Some(&token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{id} should be reachable");
+    }
+    let (status, _) = call(&h.app, req_get("/api/v1/sessions/s-multi-c", Some(&token))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unbound session must reject");
+}
+
+#[tokio::test]
 async fn scoped_token_cannot_reach_fleet_wide_endpoints() {
     let h = Harness::new().await;
     create_session(&h, "s-scope-fleet").await;
 
-    let jwt = JwtAuth::with_secret(TEST_JWT_SECRET.to_string());
-    let token = jwt
-        .generate_token("s-scope-fleet", "superadmin", 1, Some("s-scope-fleet"))
-        .expect("generate scoped token");
+    let (_, token) = mint_token(&h, &["s-scope-fleet"], None).await;
 
-    for path in ["/api/v1/sessions", "/api/v1/sessions/search"] {
+    for path in [
+        "/api/v1/sessions",
+        "/api/v1/sessions/search",
+        "/api/v1/tokens",
+    ] {
         let (status, _) = call(&h.app, req_get(path, Some(&token))).await;
         assert_eq!(
             status,
@@ -134,6 +193,86 @@ async fn scoped_token_cannot_reach_fleet_wide_endpoints() {
             "{path} is fleet-wide and must reject a session-scoped token"
         );
     }
+}
+
+#[tokio::test]
+async fn revoked_token_is_rejected() {
+    let h = Harness::new().await;
+    create_session(&h, "s-revoke").await;
+
+    let (id, token) = mint_token(&h, &["s-revoke"], None).await;
+
+    let (status, _) = call(&h.app, req_get("/api/v1/sessions/s-revoke", Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "must work before revocation");
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            &format!("/api/v1/tokens/{id}/revoke"),
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = call(&h.app, req_get("/api/v1/sessions/s-revoke", Some(&token))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a revoked token must stop working immediately, before its natural expiry"
+    );
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            &format!("/api/v1/tokens/{id}/revoke"),
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "revoking an already-revoked token is a 404, not a silent no-op"
+    );
+}
+
+#[tokio::test]
+async fn list_tokens_shows_metadata_but_never_the_bearer_value() {
+    let h = Harness::new().await;
+    create_session(&h, "s-list").await;
+
+    let (id, token) = mint_token(&h, &["s-list"], Some("audit-label")).await;
+
+    let (status, body) = call(&h.app, req_get("/api/v1/tokens", Some(TEST_TOKEN))).await;
+    assert_eq!(status, StatusCode::OK);
+    let raw = body.to_string();
+    assert!(
+        !raw.contains(&token),
+        "token list response must never include the raw bearer value"
+    );
+
+    let entries = body.get("tokens").and_then(|v| v.as_array()).unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .expect("minted token should be listed");
+    assert_eq!(
+        entry.get("name").and_then(|v| v.as_str()),
+        Some("audit-label")
+    );
+    assert_eq!(entry.get("revoked").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        entry
+            .get("session_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(1)
+    );
 }
 
 #[tokio::test]
