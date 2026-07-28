@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: mailto:cp@imtaqin.id
+    about: Please report suspected vulnerabilities privately, not as a public issue.
+  - name: REST API documentation
+    url: https://waxum.imtaqin.id/docs
+    about: Endpoint reference, webhook payloads, and auth setup.
