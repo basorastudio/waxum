@@ -78,6 +78,17 @@ pub struct SessionState {
     /// show users meaningful progress and last-error text instead of
     /// guessing from polling QR codes.
     pub pair_state: RwLock<PairState>,
+
+    /// Unix timestamp of the start of the *current* unplanned reconnect
+    /// window, set when `Event::Disconnected` fires and cleared on the next
+    /// `Event::Connected` (or when the session goes away entirely via
+    /// `Event::LoggedOut`). `None` means "not currently retrying" -- either
+    /// genuinely connected, or never connected in the first place. The
+    /// reconnect watchdog ([`crate::handlers::sessions::run_reconnect_watchdog`])
+    /// reads this to decide when a session has been stuck retrying for too
+    /// long and needs a forced full rebuild rather than waiting on
+    /// whatsapp-rust's own backoff indefinitely.
+    pub reconnecting_since: RwLock<Option<i64>>,
 }
 
 /// Snapshot of the latest pair attempt for a session. Lives entirely in
@@ -103,7 +114,26 @@ impl SessionState {
             storage_path,
             logout_history: RwLock::new(Vec::new()),
             pair_state: RwLock::new(PairState::default()),
+            reconnecting_since: RwLock::new(None),
         }
+    }
+
+    pub fn mark_reconnecting_now(&self) {
+        let mut slot = self.reconnecting_since.write();
+        if slot.is_none() {
+            *slot = Some(chrono::Utc::now().timestamp());
+        }
+    }
+
+    pub fn clear_reconnecting(&self) {
+        *self.reconnecting_since.write() = None;
+    }
+
+    /// Seconds since the current unplanned reconnect window started, or
+    /// `None` if not currently in one.
+    pub fn reconnecting_for_secs(&self) -> Option<i64> {
+        let since = (*self.reconnecting_since.read())?;
+        Some((chrono::Utc::now().timestamp() - since).max(0))
     }
 
     /// Record a LoggedOut event and return whether the session has crossed
@@ -690,6 +720,19 @@ impl AppState {
             .collect()
     }
 
+    /// Same as [`Self::session_iter`], but keeping each runtime's session
+    /// id alongside it -- needed by anything that has to act back on a
+    /// specific session (e.g. the reconnect watchdog calling
+    /// [`crate::handlers::sessions::connect_client`]), since
+    /// [`SessionState`] doesn't carry its own id.
+    pub fn session_iter_with_ids(&self) -> Vec<(String, Arc<SessionState>)> {
+        self.inner
+            .sessions
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub fn has_session(&self, session_id: &str) -> bool {
         self.inner.sessions.contains_key(session_id)
@@ -872,5 +915,42 @@ impl AppState {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnecting_since_starts_unset() {
+        let s = SessionState::new("/tmp/x".to_string());
+        assert_eq!(s.reconnecting_for_secs(), None);
+    }
+
+    #[test]
+    fn mark_reconnecting_is_idempotent() {
+        let s = SessionState::new("/tmp/x".to_string());
+        s.mark_reconnecting_now();
+        let first = *s.reconnecting_since.read();
+        assert!(first.is_some());
+
+        s.mark_reconnecting_now();
+        let second = *s.reconnecting_since.read();
+        assert_eq!(
+            first, second,
+            "a second mark while already reconnecting must not reset the window start"
+        );
+        assert!(s.reconnecting_for_secs().is_some());
+    }
+
+    #[test]
+    fn clear_reconnecting_resets_to_none() {
+        let s = SessionState::new("/tmp/x".to_string());
+        s.mark_reconnecting_now();
+        assert!(s.reconnecting_for_secs().is_some());
+
+        s.clear_reconnecting();
+        assert_eq!(s.reconnecting_for_secs(), None);
     }
 }

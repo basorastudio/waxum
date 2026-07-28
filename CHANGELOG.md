@@ -2,6 +2,47 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.1] - 2026-07-28
+
+### Fixed — auto-reconnect actually re-establishes the socket, honest status, self-heal
+
+Auto-reconnect was enabled but could get stuck instead of re-establishing
+the socket after a drop. Root causes, all fixed:
+
+- **`connect_session` raced a zombie client.** It cleared its own `Arc<Client>`
+  slot before rebuilding but never called `client.disconnect()` on
+  whatever was still there — the old client's background task (and its
+  own internal reconnect loop) kept running against the *same on-disk
+  device store*, so a manual reconnect could spawn a second `Client`
+  fighting the first for the same socket. Now disconnects the old client
+  cleanly first, every time.
+- **`connect_session` refused to act (409) while status was `Connecting`**
+  — which is exactly the status a session sits in for the *entire*
+  duration of whatsapp-rust's internal backoff after a drop. There was no
+  way to force a clean rebuild during the one window an operator would
+  need to. `Connecting` no longer blocks a reconnect request (`WaitingForQr`
+  / `WaitingForPairCode` still do, so an in-progress pairing flow isn't
+  clobbered).
+- **Status honesty**: `Event::Disconnected` never persisted to the DB
+  (every sibling transition did) and `GET /sessions/{id}` (singular)
+  used the raw cached status with no reconciliation against the live
+  socket, unlike `GET /sessions` (list) and `GET /sessions/{id}/status` —
+  so the same session could report `logged_in` from one endpoint and
+  `connecting` from another at the same instant. Both fixed: the socket
+  dying now reliably degrades `is_logged_in` and every read endpoint
+  agrees.
+- **Self-heal**: whatsapp-rust's own reconnect loop has no attempt cap of
+  its own — it backs off up to 15 minutes between tries and keeps going
+  forever, which reads as "stuck" during a prolonged outage or a wedged
+  handshake. A new watchdog (`RECONNECT_WATCHDOG_POLL_MS`, default 30s)
+  now forces the same full rebuild a manual reconnect performs once a
+  session has been retrying past `RECONNECT_MAX_ATTEMPTS` (default 10,
+  read from `client.stats().reconnect_errors`) or `RECONNECT_MAX_STUCK_SECS`
+  (default 600s) — cleanly disconnecting the wedged client and respawning
+  fresh, plus broadcasting a synthetic `disconnected` webhook/event as a
+  safety net for the (upstream) case where a socket dies silently without
+  whatsapp-rust ever dispatching a disconnect event at all.
+
 ## [0.11.0] - 2026-07-28
 
 ### Added — mintable, revocable, multi-session tokens

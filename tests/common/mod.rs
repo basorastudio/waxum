@@ -28,6 +28,8 @@ pub struct Harness {
     pub app: Router,
     #[allow(dead_code)]
     pub pool: DbPool,
+    #[allow(dead_code)]
+    pub state: AppState,
     pub _tmp: TempDir,
 }
 
@@ -52,11 +54,12 @@ impl Harness {
                 state.clone(),
                 middleware::jwt::jwt_auth_middleware,
             ))
-            .with_state(state);
+            .with_state(state.clone());
 
         Self {
             app,
             pool,
+            state,
             _tmp: tmp,
         }
     }

@@ -36,6 +36,13 @@
 //!   milliseconds (default 1000).
 //! - `MESSAGE_HISTORY_ENABLED` — set to `false` to disable best-effort
 //!   message-history ingestion (the search index; default true).
+//! - `RECONNECT_WATCHDOG_POLL_MS` — reconnect watchdog tick interval in
+//!   milliseconds (default 30000).
+//! - `RECONNECT_MAX_ATTEMPTS` — consecutive reconnect failures before the
+//!   watchdog forces a full client rebuild (default 10).
+//! - `RECONNECT_MAX_STUCK_SECS` — seconds a session may sit in
+//!   `Connecting` before the watchdog forces a rebuild, regardless of the
+//!   attempt count (default 600).
 //!
 //! ## Storage
 //!
@@ -808,6 +815,11 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
     let reconnect_state = state.clone();
     tokio::spawn(async move {
         handlers::sessions::reconnect_all_on_startup(reconnect_state).await;
+    });
+
+    let watchdog_state = state.clone();
+    tokio::spawn(async move {
+        handlers::sessions::run_reconnect_watchdog(watchdog_state).await;
     });
 
     let scheduler_state = state.clone();
