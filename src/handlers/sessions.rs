@@ -9,9 +9,9 @@ use crate::device_props::ResolvedDeviceProps;
 use crate::error::ApiError;
 use crate::models::common::SuccessResponse;
 use crate::models::sessions::{
-    ConnectRequest, CreateSessionRequest, CreateSessionResponse, DeviceInfo,
-    IssueSessionTokenRequest, IssueSessionTokenResponse, PairCodeRequest, PairCodeResponse,
-    QrCodeResponse, SessionInfo, SessionListResponse, SessionStatus, SessionStatusResponse,
+    ConnectRequest, CreateSessionRequest, CreateSessionResponse, DeviceInfo, PairCodeRequest,
+    PairCodeResponse, QrCodeResponse, SessionInfo, SessionListResponse, SessionStatus,
+    SessionStatusResponse,
 };
 use crate::models::webhooks::{WebhookConfig, WebhookEvent};
 use crate::state::AppState;
@@ -891,52 +891,6 @@ pub async fn get_device_info(
         phone_number: pn,
         lid,
         push_name,
-    }))
-}
-
-#[utoipa::path(
-    post,
-    security(("bearer_auth" = [])),
-    path = "/api/v1/sessions/{session_id}/token",
-    tag = "sessions",
-    params(
-        ("session_id" = String, Path, description = "Session ID")
-    ),
-    request_body = IssueSessionTokenRequest,
-    responses(
-        (status = 200, description = "Session-scoped token issued", body = IssueSessionTokenResponse),
-        (status = 404, description = "Session not found")
-    )
-)]
-pub async fn issue_session_token(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(request): Json<IssueSessionTokenRequest>,
-) -> Result<Json<IssueSessionTokenResponse>, ApiError> {
-    let _ = state
-        .session_manager()
-        .get_session(&session_id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
-
-    let expires_in_hours = request.expires_in_hours.unwrap_or(24 * 30).max(1);
-
-    let jwt_auth = crate::middleware::jwt::JwtAuth::new();
-    let token = jwt_auth
-        .generate_token(
-            &session_id,
-            "superadmin",
-            expires_in_hours,
-            Some(&session_id),
-        )
-        .map_err(|e| ApiError::Internal(format!("failed to generate token: {e}")))?;
-    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(expires_in_hours)).timestamp();
-
-    Ok(Json(IssueSessionTokenResponse {
-        token,
-        session_id,
-        expires_at,
     }))
 }
 

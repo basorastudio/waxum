@@ -33,6 +33,10 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// A minted token (carries a `jti`, see `crate::db::tokens`) is a
+/// session-scoped API credential -- it must not also grant the fleet-wide
+/// console, so this rejects any JWT carrying one even if its role claim
+/// says `superadmin`.
 fn token_is_superadmin(token: &str) -> bool {
     if let Ok(superadmin) = std::env::var("SUPERADMIN_TOKEN") {
         if !superadmin.is_empty() && crate::middleware::jwt::constant_time_eq(token, &superadmin) {
@@ -41,7 +45,9 @@ fn token_is_superadmin(token: &str) -> bool {
     }
     let jwt_auth = crate::middleware::jwt::JwtAuth::new();
     match jwt_auth.validate_token(token) {
-        Ok(claims) => crate::middleware::jwt::JwtAuth::is_superadmin(&claims),
+        Ok(claims) => {
+            crate::middleware::jwt::JwtAuth::is_superadmin(&claims) && claims.jti.is_none()
+        }
         Err(_) => false,
     }
 }

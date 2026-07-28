@@ -112,7 +112,6 @@ use state::AppState;
         handlers::sessions::export_session,
         handlers::sessions::import_session,
         handlers::sessions::get_device_info,
-        handlers::sessions::issue_session_token,
 
         handlers::messages::send_text,
         handlers::messages::send_image,
@@ -236,6 +235,10 @@ use state::AppState;
 
         handlers::search::search_session_messages,
         handlers::search::search_all_messages,
+
+        handlers::tokens::mint_token,
+        handlers::tokens::list_tokens,
+        handlers::tokens::revoke_token,
     ),
     components(
         schemas(
@@ -252,8 +255,6 @@ use state::AppState;
             models::sessions::QrCodeResponse,
             models::sessions::SessionStatusResponse,
             models::sessions::DeviceInfo,
-            models::sessions::IssueSessionTokenRequest,
-            models::sessions::IssueSessionTokenResponse,
 
             models::messages::SendTextRequest,
             models::messages::SendImageRequest,
@@ -386,6 +387,11 @@ use state::AppState;
             models::webhooks::WebhookListResponse,
             models::webhooks::WebhookRequest,
 
+            models::tokens::MintTokenRequest,
+            models::tokens::MintTokenResponse,
+            models::tokens::TokenSummary,
+            models::tokens::TokenListResponse,
+
             models::schedule::ScheduledMessage,
             models::schedule::ScheduledStatus,
             models::schedule::ScheduledListResponse,
@@ -429,7 +435,8 @@ use state::AppState;
         (name = "operations", description = "Spam reporting, TCToken, reconnection, and sync operations"),
         (name = "scheduler", description = "Scheduled (deferred) message sending"),
         (name = "blast", description = "Bulk-send (blast) jobs with pacing, retry and DLQ"),
-        (name = "nats", description = "NATS JetStream management and status")
+        (name = "nats", description = "NATS JetStream management and status"),
+        (name = "tokens", description = "Mint, list, and revoke session-scoped bearer tokens")
     )
 )]
 struct ApiDoc;
@@ -853,7 +860,8 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
     let app = create_router()
         .merge(swagger_router)
         .merge(console::console_router())
-        .layer(axum::middleware::from_fn(
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             middleware::jwt::jwt_auth_middleware,
         ))
         .layer(TraceLayer::new_for_http())

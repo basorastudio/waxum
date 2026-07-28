@@ -28,6 +28,7 @@ pub mod scheduled;
 pub mod schema;
 pub mod session;
 pub mod sqlite_raw;
+pub mod tokens;
 pub mod webhook_dlq;
 
 pub use session::SessionManager;

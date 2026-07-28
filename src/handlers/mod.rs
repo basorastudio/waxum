@@ -47,4 +47,5 @@ pub mod search;
 pub mod sessions;
 pub mod status;
 pub mod tags;
+pub mod tokens;
 pub mod webhooks;

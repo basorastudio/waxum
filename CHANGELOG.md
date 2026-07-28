@@ -2,6 +2,41 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.0] - 2026-07-28
+
+### Added — mintable, revocable, multi-session tokens
+
+Closes [#44](https://github.com/imtaqin/waxum/issues/44), reopened after
+initially being closed as out-of-scope: v0.10.0's single-session token
+scoping (`POST /sessions/{id}/token`) covered isolation but not the rest
+of the original ask — attaching more than one session to a token, seeing
+what's been issued, or pulling one back before it naturally expires.
+
+- **`POST /api/v1/tokens`** — mint a token bound to one or more
+  `session_ids` (a list, not a single id), with an optional `name` label
+  and `expires_in_hours`. Requires the instance's `SUPERADMIN_TOKEN` (or
+  an unscoped superadmin JWT) to call — minting is itself a fleet-wide
+  operation, same as the token it produces cannot mint further tokens.
+- **`GET /api/v1/tokens`** — list every minted token's metadata (name,
+  bound sessions, timestamps, revoked status). Never returns the bearer
+  value itself; that's only ever shown once, in the mint response.
+- **`POST /api/v1/tokens/{id}/revoke`** — invalidate a token immediately,
+  before its natural expiry.
+- New `tokens` / `token_sessions` tables (all three backends) back this:
+  a minted token's JWT carries only an opaque `jti`; the actual session
+  bindings and revocation state are looked up server-side on every
+  request, in `jwt_auth_middleware`. That DB-backed indirection is what
+  makes immediate revocation and rebinding possible without reissuing
+  the token — a plain stateless JWT can't do either.
+- A minted token cannot log into the console (full-fleet admin UI) even
+  though its JWT `role` claim reads `superadmin` — `jti`-bearing tokens
+  are explicitly excluded from console auth.
+
+**Replaces** v0.10.0's `POST /sessions/{id}/token` (single-session,
+stateless, unrevocable) — that endpoint is removed; the `session_id` JWT
+claim it used is replaced by `jti`. Not yet in any tagged release, so
+nothing to migrate for existing deployments.
+
 ## [0.10.0] - 2026-07-28
 
 ### Security — OWASP Top 10 hardening pass

@@ -54,6 +54,11 @@ fn api_routes() -> Router<AppState> {
             "/messages/search",
             get(handlers::search::search_all_messages),
         )
+        .route(
+            "/tokens",
+            post(handlers::tokens::mint_token).get(handlers::tokens::list_tokens),
+        )
+        .route("/tokens/{id}/revoke", post(handlers::tokens::revoke_token))
         .nest("/sessions", session_routes())
         .nest("/nats", nats_routes())
 }
@@ -107,10 +112,6 @@ fn session_routes() -> Router<AppState> {
         .route(
             "/{session_id}/device",
             get(handlers::sessions::get_device_info),
-        )
-        .route(
-            "/{session_id}/token",
-            post(handlers::sessions::issue_session_token),
         )
         .route(
             "/{session_id}/messages/text",

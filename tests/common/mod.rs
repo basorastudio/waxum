@@ -48,7 +48,8 @@ impl Harness {
         let recordings = waxum::storage::RecordingStore::local(tmp.path().to_str().unwrap());
         let state = AppState::new(pool.clone(), None, recordings).await;
         let app: Router = create_router()
-            .layer(axum::middleware::from_fn(
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
                 middleware::jwt::jwt_auth_middleware,
             ))
             .with_state(state);
