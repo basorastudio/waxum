@@ -113,6 +113,50 @@ async fn get_session_returns_stored_row() {
     assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("Gettable"));
 }
 
+/// `GET /sessions/{id}` (singular) used to trust the raw cached status with
+/// no reconciliation, unlike `GET /sessions` (list) and `GET
+/// /sessions/{id}/status`, which both degrade a cached `logged_in` back to
+/// `connecting` when the socket isn't actually alive. That gap meant the
+/// same session could report `logged_in` from one endpoint and `connecting`
+/// from another at the same instant -- reproduced here by setting the
+/// runtime's cached status to `LoggedIn` with no live client attached
+/// (exactly what's left behind when a socket dies without the crate ever
+/// dispatching a disconnect event) and asserting the singular endpoint
+/// degrades it the same way the others already did.
+#[tokio::test]
+async fn get_session_reconciles_stale_logged_in_status_with_no_live_client() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-stale"}),
+        ),
+    )
+    .await;
+
+    let runtime = h.state.get_or_create_session("s-stale", "/tmp/s-stale");
+    runtime.set_status(waxum::models::sessions::SessionStatus::LoggedIn);
+
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-stale", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("status").and_then(|v| v.as_str()),
+        Some("connecting"),
+        "a cached logged_in status with no live client must degrade, not report stale: {body:?}"
+    );
+    assert_eq!(
+        body.get("is_logged_in").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
 #[tokio::test]
 async fn list_after_creates_returns_all_rows() {
     let h = Harness::new().await;

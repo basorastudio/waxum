@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::{
     extract::{Multipart, Path, State},
     response::Response as AxumResponse,
@@ -177,7 +179,7 @@ pub async fn get_session(
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
     if let Some(runtime) = state.get_session(&session_id) {
-        session.status = runtime.get_status();
+        session.status = runtime.effective_status();
         session.is_logged_in = session.status == SessionStatus::LoggedIn;
     }
 
@@ -332,6 +334,16 @@ pub async fn get_qr_code(
     }))
 }
 
+/// Forces a clean rebuild when the session isn't actually live: cleanly
+/// disconnects whatever client is cached (if any) before rebuilding, rather
+/// than only clearing the `Arc` slot and leaving an old `Client`'s
+/// background task and socket running -- two live clients racing for the
+/// same on-disk device store is a real failure mode, not a hypothetical
+/// one. `Connecting` is deliberately *not* one of the refused statuses
+/// below: it's exactly the state a session sits in for the whole duration
+/// of whatsapp-rust's internal reconnect backoff after a drop, and an
+/// operator needs a way to force a rebuild out of it instead of waiting
+/// out however many backoff cycles remain.
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{session_id}/connect",
@@ -373,14 +385,16 @@ pub async fn connect_session(
         let s = runtime.get_status();
         if matches!(
             s,
-            SessionStatus::Connecting
-                | SessionStatus::WaitingForQr
-                | SessionStatus::WaitingForPairCode
+            SessionStatus::WaitingForQr | SessionStatus::WaitingForPairCode
         ) {
             return Err(ApiError::AlreadyConnected);
         }
+        if let Some(old_client) = runtime.get_client() {
+            old_client.disconnect().await;
+        }
         runtime.set_client(None);
         runtime.set_status(SessionStatus::Disconnected);
+        runtime.clear_reconnecting();
     }
 
     let storage_path = state
@@ -590,6 +604,7 @@ pub async fn disconnect_session(
     client.disconnect().await;
     runtime.set_status(SessionStatus::Disconnected);
     runtime.set_client(None);
+    runtime.clear_reconnecting();
 
     let _ = state
         .session_manager()
@@ -635,6 +650,7 @@ pub async fn export_session(
         }
         runtime.set_status(SessionStatus::Disconnected);
         runtime.set_client(None);
+        runtime.clear_reconnecting();
     }
     let _ = state
         .session_manager()
@@ -971,6 +987,113 @@ pub async fn reconnect_all_on_startup(state: AppState) {
     }
 }
 
+/// Self-heal for a session wedged in whatsapp-rust's own reconnect backoff.
+///
+/// whatsapp-rust's internal retry loop (inside `bot.run()`) has no attempt
+/// cap of its own -- it backs off up to 15 minutes between tries and keeps
+/// going forever, which in practice reads as "auto-reconnect enabled but
+/// stuck" during a prolonged outage or a wedged handshake. This watchdog
+/// ticks every `RECONNECT_WATCHDOG_POLL_MS` (default 30s) and, for any
+/// session that has been in `Connecting` for longer than
+/// `RECONNECT_MAX_STUCK_SECS` (default 600s) *or* whose
+/// `client.stats().reconnect_errors` has crossed `RECONNECT_MAX_ATTEMPTS`
+/// (default 10), forces the same full rebuild a manual `POST .../connect`
+/// performs: cleanly disconnect the wedged client (stopping its internal
+/// loop) and spawn [`connect_client`] fresh, rather than trusting the
+/// crate to eventually recover on its own. Also broadcasts a synthetic
+/// `disconnected` webhook/event as a safety net -- see the module docs on
+/// `Event::Disconnected` for why the crate doesn't always dispatch one for
+/// a socket that dies silently.
+pub async fn run_reconnect_watchdog(state: AppState) {
+    let poll_ms: u64 = std::env::var("RECONNECT_WATCHDOG_POLL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+    let max_attempts: u32 = std::env::var("RECONNECT_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let max_stuck_secs: i64 = std::env::var("RECONNECT_MAX_STUCK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(poll_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tracing::info!(
+        poll_ms,
+        max_attempts,
+        max_stuck_secs,
+        "reconnect watchdog started"
+    );
+
+    loop {
+        ticker.tick().await;
+        for (session_id, runtime) in state.session_iter_with_ids() {
+            if runtime.get_status() != SessionStatus::Connecting {
+                continue;
+            }
+            let Some(client) = runtime.get_client() else {
+                continue;
+            };
+            let stuck_secs = runtime.reconnecting_for_secs().unwrap_or(0);
+            let reconnect_errors = client.stats().reconnect_errors;
+            if reconnect_errors < max_attempts && stuck_secs < max_stuck_secs {
+                continue;
+            }
+
+            tracing::warn!(
+                session_id = %session_id,
+                reconnect_errors,
+                stuck_secs,
+                "reconnect watchdog: forcing full rebuild after a stuck retry window"
+            );
+
+            client.disconnect().await;
+            runtime.set_client(None);
+            runtime.set_status(SessionStatus::Disconnected);
+            runtime.clear_reconnecting();
+            let _ = state
+                .session_manager()
+                .update_session_status(&session_id, SessionStatus::Disconnected, false)
+                .await;
+
+            let payload = serde_json::json!({
+                "session_id": session_id,
+                "event": "disconnected",
+                "timestamp": chrono::Utc::now().timestamp(),
+                "data": { "forced_by": "reconnect_watchdog" },
+            });
+            if let Ok(payload_str) = serde_json::to_string(&payload) {
+                state
+                    .broadcast_to_webhooks(&session_id, "disconnected", &payload_str)
+                    .await;
+                state
+                    .publish_to_nats(&session_id, "disconnected", &payload_str)
+                    .await;
+                runtime.broadcast_event(payload_str);
+            }
+
+            runtime.set_status(SessionStatus::Connecting);
+            let state_clone = state.clone();
+            let session_id_clone = session_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = connect_client(&state_clone, &session_id_clone, None).await {
+                    tracing::error!(
+                        "reconnect watchdog: rebuild failed for {}: {}",
+                        session_id_clone,
+                        e
+                    );
+                    if let Some(rt) = state_clone.get_session(&session_id_clone) {
+                        rt.set_status(SessionStatus::Disconnected);
+                        rt.set_client(None);
+                    }
+                }
+            });
+        }
+    }
+}
+
 async fn connect_client(
     state: &AppState,
     session_id: &str,
@@ -1190,6 +1313,7 @@ async fn handle_event(
             runtime.set_qr_codes(vec![]);
             runtime.set_pair_code(None);
             runtime.clear_pair_state();
+            runtime.clear_reconnecting();
 
             let push_name_str = client.push_name();
             let push_name = if push_name_str.is_empty() {
@@ -1229,6 +1353,11 @@ async fn handle_event(
                 );
             }
             runtime.set_status(SessionStatus::Connecting);
+            runtime.mark_reconnecting_now();
+            let _ = state
+                .session_manager()
+                .update_session_status(session_id, SessionStatus::Connecting, false)
+                .await;
         }
         Event::LoggedOut(logged_out) => {
             if let Some(client) = runtime.get_client() {
@@ -1236,6 +1365,7 @@ async fn handle_event(
             }
             runtime.set_status(SessionStatus::Disconnected);
             runtime.set_client(None);
+            runtime.clear_reconnecting();
             let _ = state
                 .session_manager()
                 .update_session_status(session_id, SessionStatus::Disconnected, false)
