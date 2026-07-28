@@ -3456,7 +3456,13 @@ async fn do_get_user_info_lite(
 pub(crate) async fn get_media_data(media: &MediaData) -> Result<(Vec<u8>, String), ApiError> {
     match media {
         MediaData::Url { url } => {
-            let response = reqwest::get(url)
+            crate::net_guard::validate_public_url(url)
+                .await
+                .map_err(ApiError::BadRequest)?;
+
+            let response = crate::net_guard::safe_http_client()
+                .get(url)
+                .send()
                 .await
                 .map_err(|e| ApiError::BadRequest(format!("Failed to fetch URL: {}", e)))?;
 

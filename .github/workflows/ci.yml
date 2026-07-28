@@ -57,3 +57,22 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+      # `~/.cargo/bin` is already in the cache above, so cargo-audit only
+      # needs building from source once; later runs reuse the cached binary.
+      - name: Install cargo-audit (if not cached)
+        run: command -v cargo-audit || cargo install cargo-audit --locked
+
+      # --ignore entries mirror audit.toml (kept in the repo root as the
+      # human-readable record of *why* each is ignored) -- passed
+      # explicitly here since not every cargo-audit version auto-loads
+      # that file. A new advisory not in this list still fails the job.
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104

@@ -692,14 +692,33 @@ pub async fn play_call(
     }))
 }
 
+/// Shells out to `ffmpeg -i <url>` and decodes to 16kHz mono PCM.
+///
+/// ffmpeg does its own fetch of `-i <url>` -- it isn't routed through
+/// [`crate::net_guard::safe_http_client`], so that helper's per-request DNS
+/// check can't cover it. [`crate::net_guard::validate_public_url`] validates
+/// scheme + resolved address up front (blocks a request-time SSRF/LFI
+/// attempt), and `-protocol_whitelist` below pins ffmpeg's own input to the
+/// http(s) protocol handlers so it can't be pointed at `file://`,
+/// `concat:`, `subfile,,,`, and similar local I/O-capable protocols
+/// regardless of what URL string it's given. Residual risk: ffmpeg resolves
+/// the hostname itself at fetch time, a moment after our check, so a
+/// DNS-rebind in that window isn't caught the way it is for the
+/// reqwest-based paths.
 async fn decode_url_to_pcm(url: &str) -> anyhow::Result<Vec<i16>> {
     use std::process::Stdio;
+
+    crate::net_guard::validate_public_url(url)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     let ffmpeg = tokio::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
             "error",
+            "-protocol_whitelist",
+            "http,https,tls,tcp",
             "-i",
             url,
             "-f",

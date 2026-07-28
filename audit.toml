@@ -1,0 +1,32 @@
+# cargo-audit config (`cargo install cargo-audit`, run in CI's
+# .github/workflows/ci.yml). Entries here are transitive advisories with
+# no upstream fix available yet at the version we can currently take
+# without a breaking dependency bump -- each one is revisited whenever its
+# owning dependency gets updated. A NEW advisory not listed here still
+# fails CI; this file only silences the specific, already-triaged ones
+# below.
+
+[advisories]
+ignore = [
+    # quick-xml, pulled in transitively by the `s3` crate (S3-compatible
+    # call-recording storage) for parsing AWS API XML responses. No newer
+    # `s3` release exists yet that depends on a patched quick-xml. Not
+    # reachable from waxum's own request surface -- only exercised against
+    # responses from an S3-compatible endpoint the operator already
+    # configured and trusts.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attrs
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-decl allocation
+
+    # rustls-webpki 0.102.8, pulled in transitively by async-nats 0.38 (a
+    # patched 0.103.13 already coexists in the tree from other deps).
+    # Fixing this means bumping async-nats across 12 minor releases
+    # (0.38 -> 0.50), which needs its own dedicated compatibility pass
+    # against src/nats/*.rs, not a drive-by version bump. Affects
+    # certificate revocation-list / name-constraint edge cases on the
+    # *outbound* NATS connection the operator configured, not waxum's
+    # inbound HTTP surface.
+    "RUSTSEC-2026-0049", # rustls-webpki: CRL distribution-point matching
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+]

@@ -210,6 +210,29 @@ pub struct SessionStatusResponse {
     pub pair: PairStatus,
 }
 
+/// Request body for minting a session-scoped bearer token.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct IssueSessionTokenRequest {
+    /// How long the token stays valid. Defaults to 720 (30 days) when omitted.
+    #[schema(example = 720)]
+    pub expires_in_hours: Option<i64>,
+}
+
+/// A bearer token restricted to a single session -- unlike the instance's
+/// `SUPERADMIN_TOKEN` or an unscoped superadmin JWT, this token is rejected
+/// by [`crate::middleware::jwt::jwt_auth_middleware`] for every other
+/// session_id and for fleet-wide endpoints (list/purge/disconnect-all/etc).
+/// Meant for handing a single customer access to only their own WhatsApp
+/// session on a shared instance.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IssueSessionTokenResponse {
+    /// Bearer token, valid only for this session_id.
+    pub token: String,
+    pub session_id: String,
+    /// Unix timestamp the token stops validating.
+    pub expires_at: i64,
+}
+
 /// Device information
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeviceInfo {

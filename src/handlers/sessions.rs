@@ -9,9 +9,9 @@ use crate::device_props::ResolvedDeviceProps;
 use crate::error::ApiError;
 use crate::models::common::SuccessResponse;
 use crate::models::sessions::{
-    ConnectRequest, CreateSessionRequest, CreateSessionResponse, DeviceInfo, PairCodeRequest,
-    PairCodeResponse, QrCodeResponse, SessionInfo, SessionListResponse, SessionStatus,
-    SessionStatusResponse,
+    ConnectRequest, CreateSessionRequest, CreateSessionResponse, DeviceInfo,
+    IssueSessionTokenRequest, IssueSessionTokenResponse, PairCodeRequest, PairCodeResponse,
+    QrCodeResponse, SessionInfo, SessionListResponse, SessionStatus, SessionStatusResponse,
 };
 use crate::models::webhooks::{WebhookConfig, WebhookEvent};
 use crate::state::AppState;
@@ -201,6 +201,8 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
+    tracing::warn!(session_id = %session_id, "session: delete requested (storage + registry will be purged)");
+
     if let Some(runtime) = state.get_session(&session_id) {
         if let Some(client) = runtime.get_client() {
             client.disconnect().await;
@@ -771,14 +773,35 @@ fn zip_directory(dir: &str) -> anyhow::Result<Vec<u8>> {
     Ok(buf.into_inner())
 }
 
+/// Caps for [`unzip_directory`]: an import is caller-supplied and untrusted,
+/// so a crafted archive with a tiny compressed size but a huge (or
+/// unbounded) decompressed size -- a zip bomb -- must not be able to
+/// exhaust disk. `MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES` is enforced twice:
+/// once from the entry's declared size (fast rejection for the well-formed
+/// case) and once as a hard `Read::take` cap on the actual bytes copied,
+/// since the declared size in a zip's local/central header is
+/// attacker-controlled metadata, not a guarantee.
+const MAX_IMPORT_ENTRIES: usize = 20_000;
+const MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_IMPORT_TOTAL_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Unzip into `dir`, creating it if needed. Rejects entries whose path
-/// would escape `dir` (zip-slip) instead of writing them. Blocking;
-/// run inside `spawn_blocking`.
+/// would escape `dir` (zip-slip) instead of writing them, and enforces the
+/// zip-bomb caps above. Blocking; run inside `spawn_blocking`.
 fn unzip_directory(dir: &str, zip_bytes: &[u8]) -> anyhow::Result<()> {
     let base = std::path::Path::new(dir);
     std::fs::create_dir_all(base)?;
 
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))?;
+    if archive.len() > MAX_IMPORT_ENTRIES {
+        anyhow::bail!(
+            "zip has {} entries, exceeding the {} entry limit",
+            archive.len(),
+            MAX_IMPORT_ENTRIES
+        );
+    }
+
+    let mut total_uncompressed: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let Some(rel) = file.enclosed_name() else {
@@ -790,12 +813,35 @@ fn unzip_directory(dir: &str, zip_bytes: &[u8]) -> anyhow::Result<()> {
         if file.is_dir() {
             continue;
         }
-        let out_path = base.join(rel);
+
+        if file.size() > MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES {
+            anyhow::bail!(
+                "zip entry {:?} declares {} uncompressed bytes, exceeding the per-file limit",
+                rel,
+                file.size()
+            );
+        }
+        total_uncompressed = total_uncompressed.saturating_add(file.size());
+        if total_uncompressed > MAX_IMPORT_TOTAL_UNCOMPRESSED_BYTES {
+            anyhow::bail!(
+                "zip's total declared uncompressed size exceeds the {} byte limit",
+                MAX_IMPORT_TOTAL_UNCOMPRESSED_BYTES
+            );
+        }
+
+        let out_path = base.join(&rel);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut file, &mut out)?;
+        let mut limited = std::io::Read::take(&mut file, MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES + 1);
+        let copied = std::io::copy(&mut limited, &mut out)?;
+        if copied > MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES {
+            anyhow::bail!(
+                "zip entry {:?} exceeded the per-file uncompressed size limit while extracting",
+                rel
+            );
+        }
     }
     Ok(())
 }
@@ -845,6 +891,52 @@ pub async fn get_device_info(
         phone_number: pn,
         lid,
         push_name,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/token",
+    tag = "sessions",
+    params(
+        ("session_id" = String, Path, description = "Session ID")
+    ),
+    request_body = IssueSessionTokenRequest,
+    responses(
+        (status = 200, description = "Session-scoped token issued", body = IssueSessionTokenResponse),
+        (status = 404, description = "Session not found")
+    )
+)]
+pub async fn issue_session_token(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<IssueSessionTokenRequest>,
+) -> Result<Json<IssueSessionTokenResponse>, ApiError> {
+    let _ = state
+        .session_manager()
+        .get_session(&session_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
+
+    let expires_in_hours = request.expires_in_hours.unwrap_or(24 * 30).max(1);
+
+    let jwt_auth = crate::middleware::jwt::JwtAuth::new();
+    let token = jwt_auth
+        .generate_token(
+            &session_id,
+            "superadmin",
+            expires_in_hours,
+            Some(&session_id),
+        )
+        .map_err(|e| ApiError::Internal(format!("failed to generate token: {e}")))?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(expires_in_hours)).timestamp();
+
+    Ok(Json(IssueSessionTokenResponse {
+        token,
+        session_id,
+        expires_at,
     }))
 }
 
@@ -1876,5 +1968,49 @@ mod tests {
         let dst_path = dst.path().join("restored");
         let result = unzip_directory(dst_path.to_str().unwrap(), &buf.into_inner());
         assert!(result.is_err(), "path traversal entry must be rejected");
+    }
+
+    #[test]
+    fn unzip_rejects_too_many_entries() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..=MAX_IMPORT_ENTRIES {
+                writer.start_file(format!("f{i}"), options).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let dst = tempfile::tempdir().expect("dst tempdir");
+        let dst_path = dst.path().join("restored");
+        let result = unzip_directory(dst_path.to_str().unwrap(), &buf.into_inner());
+        let err = result.expect_err("entry-count limit must be enforced");
+        assert!(err.to_string().contains("entries"), "{err}");
+    }
+
+    /// The filler is all zeros -- highly compressible, so this zip stays
+    /// small on disk. A real zip bomb needs the *decompressed* size
+    /// checked, not the compressed size; that's exactly what this proves.
+    #[test]
+    fn unzip_rejects_entry_over_the_per_file_size_cap() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("huge.bin", options).unwrap();
+            let chunk = vec![0u8; 8 * 1024 * 1024];
+            let chunks_needed = (MAX_IMPORT_ENTRY_UNCOMPRESSED_BYTES / chunk.len() as u64) + 1;
+            for _ in 0..chunks_needed {
+                std::io::Write::write_all(&mut writer, &chunk).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let dst = tempfile::tempdir().expect("dst tempdir");
+        let dst_path = dst.path().join("restored");
+        let result = unzip_directory(dst_path.to_str().unwrap(), &buf.into_inner());
+        let err = result.expect_err("per-entry uncompressed size limit must be enforced");
+        assert!(err.to_string().contains("per-file"), "{err}");
     }
 }

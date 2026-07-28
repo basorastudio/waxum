@@ -73,11 +73,9 @@ pub async fn register_webhook(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
-    if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-        return Err(ApiError::BadRequest(
-            "Webhook URL must start with http:// or https://".to_string(),
-        ));
-    }
+    crate::net_guard::validate_public_url(&request.url)
+        .await
+        .map_err(ApiError::BadRequest)?;
 
     let existing = state.get_webhooks(&session_id);
     if existing.iter().any(|(_, w)| w.url == request.url) {

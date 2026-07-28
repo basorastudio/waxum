@@ -3,7 +3,11 @@
 //! CSRF token flow because every write endpoint is a POST from
 //! same-origin JS driven by the operator who already holds the cookie,
 //! and there is no third-party embedding surface. SameSite=Strict on
-//! the cookie makes cross-site POSTs unusable.
+//! the cookie makes cross-site POSTs unusable. `Secure` is added
+//! whenever the request arrived over TLS (detected via
+//! `X-Forwarded-Proto`, see `console_cookie_attrs`) and omitted
+//! otherwise, so a plain `cargo run` over `http://localhost` still
+//! works with no extra config.
 
 use axum::{
     body::Body,
@@ -31,7 +35,7 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 
 fn token_is_superadmin(token: &str) -> bool {
     if let Ok(superadmin) = std::env::var("SUPERADMIN_TOKEN") {
-        if !superadmin.is_empty() && token == superadmin {
+        if !superadmin.is_empty() && crate::middleware::jwt::constant_time_eq(token, &superadmin) {
             return true;
         }
     }
@@ -39,6 +43,30 @@ fn token_is_superadmin(token: &str) -> bool {
     match jwt_auth.validate_token(token) {
         Ok(claims) => crate::middleware::jwt::JwtAuth::is_superadmin(&claims),
         Err(_) => false,
+    }
+}
+
+/// Whether to mark the console cookie `Secure`. Waxum itself only ever
+/// speaks plain HTTP (see `main.rs` -- TLS, if any, is terminated by a
+/// reverse proxy in front of it), so there's no local signal for "this
+/// connection is actually TLS". `X-Forwarded-Proto` is the de facto
+/// standard a proxy sets to say so; trusting a client that spoofs it can
+/// only make the cookie *stricter* (sent without `Secure` over their own
+/// plaintext connection, so it just doesn't get echoed back to them) --
+/// never weaker. A direct `cargo run` with no proxy in front sees no such
+/// header and keeps working over `http://localhost` exactly as before.
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+}
+
+fn console_cookie_attrs(headers: &HeaderMap) -> &'static str {
+    if request_is_https(headers) {
+        "Path=/; HttpOnly; Secure; SameSite=Strict"
+    } else {
+        "Path=/; HttpOnly; SameSite=Strict"
     }
 }
 
@@ -243,8 +271,9 @@ pub struct LoginForm {
     token: String,
 }
 
-pub async fn login_submit(Form(form): Form<LoginForm>) -> Response {
+pub async fn login_submit(headers: HeaderMap, Form(form): Form<LoginForm>) -> Response {
     if !token_is_superadmin(form.token.trim()) {
+        tracing::warn!("console: rejected login attempt with an invalid token");
         return html(render_page(
             "Sign in",
             "login",
@@ -255,8 +284,9 @@ pub async fn login_submit(Form(form): Form<LoginForm>) -> Response {
     }
 
     let cookie = format!(
-        "{CONSOLE_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
-        form.token.trim()
+        "{CONSOLE_COOKIE}={}; {}; Max-Age=2592000",
+        form.token.trim(),
+        console_cookie_attrs(&headers)
     );
     let mut r = redirect_to("/");
     r.headers_mut()
@@ -264,8 +294,11 @@ pub async fn login_submit(Form(form): Form<LoginForm>) -> Response {
     r
 }
 
-pub async fn logout() -> Response {
-    let cookie = format!("{CONSOLE_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+pub async fn logout(headers: HeaderMap) -> Response {
+    let cookie = format!(
+        "{CONSOLE_COOKIE}=; {}; Max-Age=0",
+        console_cookie_attrs(&headers)
+    );
     let mut r = redirect_to("/login");
     r.headers_mut()
         .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());

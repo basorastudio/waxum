@@ -11,9 +11,17 @@
 //! - `/api/v1/nats/*` — NATS stream ops.
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
+
+/// Axum's `Bytes`-based extractors (`Multipart` fields among them) cap
+/// bodies at 2MB by default -- fine for JSON, too small for real media or a
+/// session storage archive. These routes get an explicit, deliberate raise
+/// instead of silently inheriting that default or being left unbounded.
+const MAX_MEDIA_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+const MAX_SESSION_IMPORT_BYTES: usize = 512 * 1024 * 1024;
 
 use crate::handlers;
 use crate::state::AppState;
@@ -93,11 +101,16 @@ fn session_routes() -> Router<AppState> {
         )
         .route(
             "/{session_id}/import",
-            post(handlers::sessions::import_session),
+            post(handlers::sessions::import_session)
+                .layer(DefaultBodyLimit::max(MAX_SESSION_IMPORT_BYTES)),
         )
         .route(
             "/{session_id}/device",
             get(handlers::sessions::get_device_info),
+        )
+        .route(
+            "/{session_id}/token",
+            post(handlers::sessions::issue_session_token),
         )
         .route(
             "/{session_id}/messages/text",
@@ -421,7 +434,8 @@ fn session_routes() -> Router<AppState> {
         )
         .route(
             "/{session_id}/media/upload",
-            post(handlers::media::upload_media),
+            post(handlers::media::upload_media)
+                .layer(DefaultBodyLimit::max(MAX_MEDIA_UPLOAD_BYTES)),
         )
         .route(
             "/{session_id}/media/download",
