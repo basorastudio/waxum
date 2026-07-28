@@ -22,8 +22,27 @@ use axum::{
     Json,
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use once_cell::sync::Lazy;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+/// Process-local fallback signing secret, used only when `JWT_SECRET` is
+/// unset. Generated once per process from OS entropy rather than a fixed
+/// string baked into the binary — a hardcoded fallback here would let anyone
+/// who has read this source forge a superadmin token against any instance
+/// that forgot to set `JWT_SECRET`. The tradeoff: tokens signed against this
+/// fallback stop validating on restart, which is the point — it bounds how
+/// long a leaked token (e.g. from the boot-banner print) stays useful.
+static FALLBACK_JWT_SECRET: Lazy<String> = Lazy::new(|| {
+    tracing::warn!(
+        "JWT_SECRET is not set; using a random secret generated for this \
+         process only. Tokens will stop validating after a restart. Set \
+         JWT_SECRET to a strong, stable value before deploying to production."
+    );
+    let bytes: [u8; 32] = rand::thread_rng().gen();
+    hex::encode(bytes)
+});
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -34,6 +53,16 @@ pub struct Claims {
     pub exp: usize,
 
     pub iat: usize,
+
+    /// Restricts this token to a single `session_id`, checked in
+    /// [`jwt_auth_middleware`] against every `/api/v1/sessions/{session_id}/*`
+    /// request. `None` (the default for tokens minted before this field
+    /// existed, and for the operator-wide `SUPERADMIN_TOKEN`/boot token) is
+    /// unrestricted -- unchanged, pre-existing behavior. `Some(id)` is how a
+    /// customer-facing token is handed out without also granting it every
+    /// *other* customer's session on the same instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,8 +78,7 @@ impl Default for JwtAuth {
 
 impl JwtAuth {
     pub fn new() -> Self {
-        let secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "your-super-secret-jwt-key-change-in-production".to_string());
+        let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| FALLBACK_JWT_SECRET.clone());
         Self { secret }
     }
 
@@ -64,6 +92,7 @@ impl JwtAuth {
         subject: &str,
         role: &str,
         expires_in_hours: i64,
+        session_id: Option<&str>,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = chrono::Utc::now();
         let exp = (now + chrono::Duration::hours(expires_in_hours)).timestamp() as usize;
@@ -74,6 +103,7 @@ impl JwtAuth {
             role: role.to_string(),
             exp,
             iat,
+            session_id: session_id.map(|s| s.to_string()),
         };
 
         encode(
@@ -95,6 +125,18 @@ impl JwtAuth {
     pub fn is_superadmin(claims: &Claims) -> bool {
         claims.role == "superadmin"
     }
+}
+
+/// Best-effort caller IP for auth-failure logging. `main.rs` serves via
+/// `into_make_service_with_connect_info::<SocketAddr>()`, so this is
+/// present on every real request; falls back gracefully (e.g. in tests that
+/// build the router without connect-info) rather than panicking.
+fn peer_ip(request: &Request<Body>) -> String {
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response {
@@ -128,11 +170,14 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
             None
         });
 
+    let peer = peer_ip(&request);
+
     let token: String = match auth_header {
         Some(header) if header.starts_with("Bearer ") => header[7..].to_string(),
         _ => match cookie_token {
             Some(t) => t,
             None => {
+                tracing::warn!(peer = %peer, path = %path, "auth: missing bearer token/cookie");
                 return unauthorized_response(
                     "Missing or invalid Authorization header. Use: Bearer <token>",
                 );
@@ -142,7 +187,7 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     let token = token.as_str();
 
     if let Ok(superadmin_token) = std::env::var("SUPERADMIN_TOKEN") {
-        if !superadmin_token.is_empty() && token == superadmin_token {
+        if !superadmin_token.is_empty() && constant_time_eq(token, &superadmin_token) {
             return next.run(request).await;
         }
     }
@@ -150,12 +195,27 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     match jwt_auth.validate_token(token) {
         Ok(claims) => {
             if !JwtAuth::is_superadmin(&claims) {
+                tracing::warn!(peer = %peer, path = %path, role = %claims.role, "auth: non-superadmin role rejected");
                 return forbidden_response("Superadmin role required");
+            }
+
+            if let Some(scope) = claims.session_id.as_deref() {
+                match session_id_from_path(path) {
+                    Some(requested) if requested == scope => {}
+                    _ => {
+                        tracing::warn!(
+                            peer = %peer, path = %path, scope = %scope,
+                            "auth: token scoped to a different session attempted cross-session access"
+                        );
+                        return forbidden_response("Token is scoped to a different session");
+                    }
+                }
             }
 
             next.run(request).await
         }
         Err(e) => {
+            tracing::warn!(peer = %peer, path = %path, error = %e, "auth: token validation failed");
             let message = match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => "Token has expired",
                 jsonwebtoken::errors::ErrorKind::InvalidToken => "Invalid token format",
@@ -165,6 +225,36 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
             unauthorized_response(message)
         }
     }
+}
+
+/// Pulls the `{session_id}` segment out of a `/api/v1/sessions/{session_id}/...`
+/// request path, or `None` for anything else -- including the fleet-wide
+/// operations nested under the same `/sessions` prefix (`/`, `/purge`,
+/// `/disconnect-all`, `/reconnect-all`, `/search`), which a session-scoped
+/// token must not be able to reach since they aren't bounded to one session.
+fn session_id_from_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/v1/sessions/")?;
+    let id = rest.split('/').next()?;
+    if id.is_empty() || matches!(id, "purge" | "disconnect-all" | "reconnect-all" | "search") {
+        return None;
+    }
+    Some(id)
+}
+
+/// Constant-time string comparison for secret/token checks. A plain `==`
+/// short-circuits on the first mismatched byte, which turns a bearer-token
+/// check into a timing oracle for brute-forcing a long-lived secret one byte
+/// at a time; this walks the full length regardless of where it first
+/// differs.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn unauthorized_response(message: &str) -> Response {
@@ -198,7 +288,7 @@ pub fn get_superadmin_token() -> (String, bool) {
 
     let jwt_auth = JwtAuth::new();
     let token = jwt_auth
-        .generate_token("superadmin", "superadmin", 24 * 365)
+        .generate_token("superadmin", "superadmin", 24 * 365, None)
         .expect("Failed to generate token");
     (token, false)
 }
@@ -207,6 +297,6 @@ pub fn get_superadmin_token() -> (String, bool) {
 pub fn generate_superadmin_token() -> String {
     let jwt_auth = JwtAuth::new();
     jwt_auth
-        .generate_token("superadmin", "superadmin", 24 * 365)
+        .generate_token("superadmin", "superadmin", 24 * 365, None)
         .expect("Failed to generate token")
 }

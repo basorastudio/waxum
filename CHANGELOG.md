@@ -2,6 +2,110 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.10.0] - 2026-07-28
+
+### Security — OWASP Top 10 hardening pass
+
+Full audit against the OWASP Top 10 (4 parallel reviewers covering access
+control/auth, injection/crypto, SSRF/integrity/design, and
+misconfiguration/dependencies/logging), then fixed everything found.
+
+**Critical**
+
+- **JWT signing secret**: removed the hardcoded fallback
+  (`"your-super-secret-jwt-key-change-in-production"`, live in this repo's
+  public history) used whenever `JWT_SECRET` was unset. Replaced with a
+  random secret generated once per process (`net_guard`-style
+  `once_cell::Lazy`) — an instance that forgets to set `JWT_SECRET` no
+  longer signs tokens with a secret anyone can read on GitHub; tokens
+  minted against the fallback just stop validating on restart instead.
+- **SSRF via "send media by URL"**: `POST .../messages/image` (and
+  video/audio/document/sticker) accepted a caller-supplied URL and
+  fetched it with a bare `reqwest::get`, no validation at all — a
+  request could target `169.254.169.254` (cloud metadata) or any
+  internal service and have the response delivered back as a WhatsApp
+  attachment. New `src/net_guard.rs` validates scheme + resolves the
+  host, rejecting loopback/link-local/private/CGNAT/multicast/etc
+  targets, and a custom `reqwest::dns::Resolve` re-checks on every DNS
+  resolution (including redirect hops) so a URL that resolves safely at
+  registration time but gets DNS-rebound later still can't be reached.
+  Applied to media-by-URL, webhook registration + delivery, and the
+  `/calls/play` audio-URL → ffmpeg path (plus `-protocol_whitelist
+  http,https,tls,tcp` there, since ffmpeg does its own fetch outside
+  our HTTP client).
+
+**Access control**
+
+- **Per-session token scoping**: every valid token was previously a
+  global superadmin — any credential could read/send/delete on *every*
+  session on the instance, not just its own. `POST
+  .../sessions/{id}/token` mints a token restricted to exactly that
+  `session_id`; `jwt_auth_middleware` now rejects a scoped token for any
+  other session_id or for fleet-wide endpoints (list/purge/disconnect-all/
+  search). Existing `SUPERADMIN_TOKEN` and previously-issued unscoped
+  JWTs are unaffected — this is additive, not a behavior change for
+  current users.
+- **Timing side-channel**: bearer/console token comparisons used `==`
+  (short-circuits on the first mismatched byte); switched to a
+  constant-time comparison.
+- **Rate limiting**: there was none, anywhere. Added a global per-peer-IP
+  limiter (`tower_governor`, `RATE_LIMIT_PER_SECOND`/`RATE_LIMIT_BURST`
+  env vars, defaults 20/50), keyed on the TCP peer address rather than
+  `X-Forwarded-For` so it can't be trivially bypassed by a client
+  spoofing a fresh fake IP per request.
+- **CORS**: was a hardcoded wildcard with no way to restrict it.
+  `CORS_ALLOWED_ORIGINS` (comma-separated) now locks it down; still
+  defaults to permissive (with a startup warning) so `cargo run` stays
+  zero-config.
+- **Console cookie**: added `Secure` whenever the request arrived over
+  TLS (detected via `X-Forwarded-Proto`, set by the fronting reverse
+  proxy in the deployments that documented this project actually runs
+  in) — `HttpOnly`/`SameSite=Strict` were already correct. A direct
+  `cargo run` over plain `http://localhost` keeps working with no
+  config, since there's no proxy setting that header.
+
+**Resource exhaustion / integrity**
+
+- **Session import zip-bomb**: `unzip_directory` had zip-slip (path
+  traversal) protection but no cap on entry count or decompressed size
+  — a small crafted archive could exhaust disk. Added entry-count
+  (20,000), per-file (512MB), and total (2GB) uncompressed-size caps,
+  the per-file one enforced against actual bytes copied (not just the
+  zip's self-reported, attacker-controlled size header).
+- **Upload size caps**: `Multipart` bodies were relying on axum's
+  undocumented-in-practice implicit 2MB default (too small for real
+  media/session archives, and not a deliberate choice). `/media/upload`
+  and `/sessions/{id}/import` now carry explicit, intentional
+  `DefaultBodyLimit` caps (100MB / 512MB).
+- **Webhook replay protection**: HMAC signing now covers
+  `{timestamp}.{payload}` (via a new `X-Webhook-Timestamp` header) instead
+  of just the payload — a captured `(url, signature, body)` triple
+  previously replayed forever with a valid signature. **Receivers that
+  verify signatures need to update their verification code** — see
+  `waxum-doc/docs/api/webhooks.md`'s updated Node.js/Python examples.
+
+**Other**
+
+- Failed-auth attempts (missing token, wrong role, cross-session scope
+  violation, invalid signature) and sensitive lifecycle events (session
+  delete) are now logged via `tracing::warn!`.
+- Docker image now runs as a non-root `waxum` user instead of root.
+- `contacts` search LIKE queries didn't escape `%`/`_` in the caller's
+  search term (cosmetic — still safely parameter-bound, not SQL
+  injection — but a caller could widen their own results with wildcard
+  metacharacters). Now uses the same escaping `messages.rs` search
+  already had. Incidentally found and fixed a related latent bug while
+  doing this: `messages.rs`'s LIKE-fallback path used the same `ESCAPE`
+  SQL text for MySQL and SQLite, but MySQL (unlike SQLite/Postgres)
+  interprets backslash escapes inside its own string literals, so the
+  shared syntax was likely malformed SQL against a real MySQL backend.
+  Split into per-dialect syntax, covered by a new SQLite-backed
+  regression test (`tests/contacts_search.rs`) that exercises the actual
+  SQL text rather than just checking it compiles.
+- `cargo audit` added to CI. Found 6 real (transitive, currently
+  unfixable without a larger dependency bump — tracked in `audit.toml`)
+  advisories on first run; 0 in waxum's own direct dependency choices.
+
 ## [0.9.8] - 2026-07-26
 
 ### Added — resolved phone number in message webhooks (`from_phone`)

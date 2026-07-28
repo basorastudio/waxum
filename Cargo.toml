@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "waxum"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
 authors = ["taqin"]
 license = "MIT"
@@ -70,6 +70,10 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# URL parsing for the SSRF guard (net_guard.rs) -- validating scheme and
+# host before any server-side fetch of a caller-supplied URL.
+url = "2"
+
 # JWT authentication
 jsonwebtoken = "9"
 
@@ -105,6 +109,8 @@ s3 = "0.1"
 # in bzip2/lzma/xz, some of which wrap native C libraries we don't
 # need for a plain directory archive.
 zip = { version = "3", default-features = false, features = ["deflate"] }
+tower_governor = { version = "0.8.0", default-features = false, features = ["axum"] }
+governor = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"

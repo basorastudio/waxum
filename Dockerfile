@@ -43,7 +43,10 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=rust-builder /app/target/release/waxum /app/waxum
 
-RUN mkdir -p /app/whatsapp_sessions
+RUN mkdir -p /app/whatsapp_sessions \
+    && groupadd --system --gid 1000 waxum \
+    && useradd --system --uid 1000 --gid waxum --no-create-home --shell /usr/sbin/nologin waxum \
+    && chown -R waxum:waxum /app
 
 ENV WHATSAPP_STORAGE_PATH=/app/whatsapp_sessions
 ENV RUST_LOG=waxum=info,tower_http=info
@@ -52,5 +55,7 @@ EXPOSE 3451
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS --max-time 4 http://127.0.0.1:3451/health || exit 1
+
+USER waxum:waxum
 
 CMD ["/app/waxum"]

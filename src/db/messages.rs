@@ -319,6 +319,15 @@ enum LikeValue {
 
 /// Build the LIKE fallback SQL + params for SQLite/MySQL (`?`
 /// placeholders). Caller converts [`LikeValue`] into driver values.
+///
+/// The `ESCAPE` clause's backslash differs per dialect: SQLite's string
+/// literals don't process backslash escapes at all, so the SQL text's
+/// single `\` is already the one literal backslash character
+/// [`like_pattern`] escaped the value with. MySQL *does* interpret
+/// backslash escapes inside string literals by default -- a lone `\`
+/// immediately before the closing quote would escape that quote instead
+/// of terminating the string, so its SQL text needs `\\` (MySQL's own
+/// escape sequence for one literal backslash) instead.
 fn like_query(
     pool: &DbPool,
     session_id: Option<&str>,
@@ -328,7 +337,8 @@ fn like_query(
 ) -> (String, Vec<LikeValue>) {
     let mut values: Vec<LikeValue> = vec![LikeValue::Text(like_pattern(query))];
     let mut where_sql = match pool {
-        DbPool::MySQL(_) | DbPool::SQLite(_) => "body LIKE ? ESCAPE '\\'".to_string(),
+        DbPool::SQLite(_) => "body LIKE ? ESCAPE '\\'".to_string(),
+        DbPool::MySQL(_) => "body LIKE ? ESCAPE '\\\\'".to_string(),
         DbPool::Postgres(_) => unreachable!("postgres fallback uses pg_search_ilike"),
     };
     if let Some(sid) = session_id {
@@ -344,7 +354,7 @@ fn like_query(
 }
 
 /// Escape a user query for `LIKE … ESCAPE '\'` and wrap it in `%…%`.
-fn like_pattern(query: &str) -> String {
+pub(crate) fn like_pattern(query: &str) -> String {
     let escaped = query
         .replace('\\', "\\\\")
         .replace('%', "\\%")

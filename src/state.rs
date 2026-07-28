@@ -32,6 +32,13 @@ use crate::nats::NatsManager;
 /// downtime on a webhook target piled tokio tasks faster than they could
 /// drain — we observed ~600 threads on a 0 % CPU idle process. A shared
 /// client with explicit timeouts keeps each task bounded to ~10 s.
+///
+/// `dns_resolver` is [`crate::net_guard::SsrfSafeResolver`]: registration
+/// already rejects a webhook URL that resolves to a private/internal
+/// address (`net_guard::validate_public_url`), but that check happens once,
+/// up front. This resolver repeats it on every actual delivery — including
+/// redirect hops, which re-resolve their target host — so a URL that only
+/// *later* gets DNS-rebound to an internal target still can't be reached.
 fn webhook_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -40,6 +47,7 @@ fn webhook_client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(16)
+            .dns_resolver(std::sync::Arc::new(crate::net_guard::SsrfSafeResolver))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
@@ -714,6 +722,16 @@ impl AppState {
             .and_then(|m| m.remove(webhook_id).map(|(_, v)| v))
     }
 
+    /// Delivers `payload` to every enabled, matching webhook for
+    /// `session_id`, HMAC-signing it when the webhook has a `secret`.
+    ///
+    /// The signature is computed over `{timestamp}.{payload}`, with the
+    /// timestamp also sent as `X-Webhook-Timestamp`, not over the payload
+    /// alone: a captured `(url, signature, body)` tuple would otherwise
+    /// replay forever with a still-valid signature. Binding the signature
+    /// to a timestamp that ships alongside it lets a receiver reject
+    /// anything outside a short window -- see webhooks.md for the
+    /// verification recipe receivers are expected to implement.
     pub async fn broadcast_to_webhooks(&self, session_id: &str, event: &str, payload: &str) {
         self.push_event(session_id, event, payload);
 
@@ -753,9 +771,11 @@ impl AppState {
                         tokio::time::sleep(Duration::from_millis(*delay)).await;
                     }
 
+                    let timestamp = chrono::Utc::now().timestamp();
                     let mut req = client
                         .post(&url)
                         .header("Content-Type", "application/json")
+                        .header("X-Webhook-Timestamp", timestamp.to_string())
                         .body(payload.clone());
 
                     if let Some(secret) = &secret {
@@ -764,7 +784,7 @@ impl AppState {
 
                         type HmacSha256 = Hmac<Sha256>;
                         if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
-                            mac.update(payload.as_bytes());
+                            mac.update(format!("{timestamp}.{payload}").as_bytes());
                             let signature = hex::encode(mac.finalize().into_bytes());
                             req =
                                 req.header("X-Webhook-Signature", format!("sha256={}", signature));

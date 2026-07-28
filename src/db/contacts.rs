@@ -1,3 +1,4 @@
+use crate::db::messages::like_pattern;
 use crate::db::session::{sqlite_blocking, DbPool};
 use crate::db::sqlite_raw::{self, Value as SQ};
 use serde::Serialize;
@@ -131,11 +132,11 @@ impl<'a> ContactStore<'a> {
             DbPool::Postgres(pg) => {
                 let client = pg.get().await?;
                 let rows = if let Some(q) = search {
-                    let q_like = format!("%{}%", q);
+                    let q_like = like_pattern(q);
                     client.query(
                         "SELECT jid, phone, lid_jid, full_name, first_name, push_name, business_name, source, to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS')
                          FROM contacts WHERE session_id = $1
-                         AND (full_name ILIKE $2 OR first_name ILIKE $2 OR push_name ILIKE $2 OR phone ILIKE $2 OR business_name ILIKE $2)
+                         AND (full_name ILIKE $2 ESCAPE '\\' OR first_name ILIKE $2 ESCAPE '\\' OR push_name ILIKE $2 ESCAPE '\\' OR phone ILIKE $2 ESCAPE '\\' OR business_name ILIKE $2 ESCAPE '\\')
                          ORDER BY COALESCE(full_name, push_name, jid) ASC LIMIT $3 OFFSET $4",
                         &[&session_id, &q_like, &(limit as i64), &(offset as i64)],
                     ).await?
@@ -176,11 +177,11 @@ impl<'a> ContactStore<'a> {
                     String,
                     Option<String>,
                 )> = if let Some(q) = search {
-                    let q_like = format!("%{}%", q);
+                    let q_like = like_pattern(q);
                     conn.exec(
                         "SELECT jid, phone, lid_jid, full_name, first_name, push_name, business_name, source, updated_at
                          FROM contacts WHERE session_id = ?
-                         AND (full_name LIKE ? OR first_name LIKE ? OR push_name LIKE ? OR phone LIKE ? OR business_name LIKE ?)
+                         AND (full_name LIKE ? ESCAPE '\\\\' OR first_name LIKE ? ESCAPE '\\\\' OR push_name LIKE ? ESCAPE '\\\\' OR phone LIKE ? ESCAPE '\\\\' OR business_name LIKE ? ESCAPE '\\\\')
                          ORDER BY COALESCE(full_name, push_name, jid) ASC LIMIT ? OFFSET ?",
                         (session_id, &q_like, &q_like, &q_like, &q_like, &q_like, limit as i64, offset as i64),
                     ).await?
@@ -209,7 +210,7 @@ impl<'a> ContactStore<'a> {
             }
             DbPool::SQLite(pool) => {
                 let sid = session_id.to_string();
-                let q = search.map(|s| format!("%{}%", s));
+                let q = search.map(like_pattern);
                 let limit_i = limit as i64;
                 let offset_i = offset as i64;
                 sqlite_blocking(pool, move |conn| {
@@ -227,7 +228,7 @@ impl<'a> ContactStore<'a> {
                     if let Some(qq) = q {
                         sqlite_raw::query(
                             conn,
-                            "SELECT jid, phone, lid_jid, full_name, first_name, push_name, business_name, source, updated_at FROM contacts WHERE session_id = ? AND (COALESCE(full_name,'') LIKE ? OR COALESCE(first_name,'') LIKE ? OR COALESCE(push_name,'') LIKE ? OR COALESCE(phone,'') LIKE ? OR COALESCE(business_name,'') LIKE ?) ORDER BY COALESCE(full_name, push_name, jid) ASC LIMIT ? OFFSET ?",
+                            "SELECT jid, phone, lid_jid, full_name, first_name, push_name, business_name, source, updated_at FROM contacts WHERE session_id = ? AND (COALESCE(full_name,'') LIKE ? ESCAPE '\\' OR COALESCE(first_name,'') LIKE ? ESCAPE '\\' OR COALESCE(push_name,'') LIKE ? ESCAPE '\\' OR COALESCE(phone,'') LIKE ? ESCAPE '\\' OR COALESCE(business_name,'') LIKE ? ESCAPE '\\') ORDER BY COALESCE(full_name, push_name, jid) ASC LIMIT ? OFFSET ?",
                             &[SQ::Text(sid), SQ::Text(qq.clone()), SQ::Text(qq.clone()), SQ::Text(qq.clone()), SQ::Text(qq.clone()), SQ::Text(qq), SQ::Int(limit_i), SQ::Int(offset_i)],
                             mapper,
                         )

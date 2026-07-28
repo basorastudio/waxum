@@ -47,8 +47,14 @@
 //!   whichever DB `DATABASE_URL` points at.
 use anyhow::Result;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tower_governor::{
+    governor::{GovernorConfig, GovernorConfigBuilder},
+    key_extractor::PeerIpKeyExtractor,
+    GovernorLayer,
+};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -106,6 +112,7 @@ use state::AppState;
         handlers::sessions::export_session,
         handlers::sessions::import_session,
         handlers::sessions::get_device_info,
+        handlers::sessions::issue_session_token,
 
         handlers::messages::send_text,
         handlers::messages::send_image,
@@ -245,6 +252,8 @@ use state::AppState;
             models::sessions::QrCodeResponse,
             models::sessions::SessionStatusResponse,
             models::sessions::DeviceInfo,
+            models::sessions::IssueSessionTokenRequest,
+            models::sessions::IssueSessionTokenResponse,
 
             models::messages::SendTextRequest,
             models::messages::SendImageRequest,
@@ -440,6 +449,107 @@ impl utoipa::Modify for SecurityAddon {
                         .build(),
                 ),
             );
+        }
+    }
+}
+
+/// Builds the global per-peer-IP rate limiter (`RATE_LIMIT_PER_SECOND` /
+/// `RATE_LIMIT_BURST` env vars, default 20/50) and spawns the background
+/// task that periodically evicts stale entries from its state map --
+/// without that, the map only grows and becomes an unbounded memory leak
+/// in front of a public server.
+///
+/// No rate limiting existed anywhere in the stack before this -- a bearer
+/// token holder (or an unauthenticated caller hitting `/login`) could
+/// hammer pairing codes, blast sends, or webhook registration unbounded.
+/// Keyed on the TCP peer address ([`PeerIpKeyExtractor`]) rather than
+/// `X-Forwarded-For`/`X-Real-IP`: those headers are client-controlled
+/// unless a trusted proxy strips and re-sets them, and trusting them
+/// blindly would let a client bypass the limit entirely by sending a fresh
+/// fake IP on every request. The tradeoff is that behind an unconfigured
+/// reverse proxy every client shares one quota (the proxy's peer IP) --
+/// less precise, but not bypassable. Applied as the outermost layer in
+/// [`async_main`] so every request is rate-limited before it costs a JWT
+/// validation or reaches a handler.
+fn build_rate_limiter(
+) -> Arc<GovernorConfig<PeerIpKeyExtractor, governor::middleware::NoOpMiddleware>> {
+    let per_second: u64 = std::env::var("RATE_LIMIT_PER_SECOND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let burst: u32 = std::env::var("RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(PeerIpKeyExtractor)
+            .per_second(per_second)
+            .burst_size(burst)
+            .finish()
+            .expect("valid rate-limit configuration"),
+    );
+
+    let limiter = conf.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            limiter.retain_recent();
+        }
+    });
+
+    conf
+}
+
+/// Builds the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated exact
+/// origins, e.g. `https://app.example.com,https://admin.example.com`).
+/// Unset keeps the historical permissive default (`Any`) so `cargo run`
+/// stays zero-config -- but a bearer token is readable by any origin's JS
+/// via `fetch()` under that default, so production deployments should set
+/// this.
+fn build_cors_layer() -> CorsLayer {
+    match std::env::var("CORS_ALLOWED_ORIGINS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let origins: Vec<axum::http::HeaderValue> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| match s.parse() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        tracing::warn!("CORS_ALLOWED_ORIGINS: ignoring invalid origin '{}'", s);
+                        None
+                    }
+                })
+                .collect();
+
+            if origins.is_empty() {
+                tracing::warn!(
+                    "CORS_ALLOWED_ORIGINS was set but contained no valid origins; \
+                     falling back to permissive CORS (any origin allowed)"
+                );
+                return CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any);
+            }
+
+            tracing::info!("CORS restricted to {} configured origin(s)", origins.len());
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+        _ => {
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS not set -- allowing requests from any origin. \
+                 Set a comma-separated allowlist before deploying to production."
+            );
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
         }
     }
 }
@@ -716,10 +826,8 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
         }
     }
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors_layer();
+    let governor_conf = build_rate_limiter();
 
     let (superadmin_token, from_env) = middleware::jwt::get_superadmin_token();
     println!();
@@ -750,6 +858,7 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
         ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+        .layer(GovernorLayer::new(governor_conf))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")
@@ -774,7 +883,11 @@ async fn async_main(worker_threads: usize, blocking_threads: usize) -> Result<()
     println!();
 
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

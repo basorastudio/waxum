@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new endpoint, capability, or improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Endpoint-shaped requests move fastest if you can sketch the shape
+        you want (method, path, request/response body) — waxum wraps the
+        upstream `whatsapp-rust` client, so also worth checking whether
+        the underlying WhatsApp Web capability already exists there.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The underlying use case, not just the API shape.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API (if applicable)
+      description: >-
+        Sketch a request/response, or point at an existing similar
+        endpoint in `src/handlers/` you'd model it after.
+      placeholder: |
+        POST /api/v1/sessions/{session_id}/messages/some-new-type
+        { "to": "...", ... }
+      render: json
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: >-
+        Anything you're currently doing instead (combining existing
+        endpoints, client-side workaround, etc.) helps calibrate priority.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
