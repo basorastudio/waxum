@@ -2,6 +2,38 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.3] - 2026-07-31
+
+### Changed — bumped vendored `whatsapp-rust` (`dde51e7a` → `13fce2f0`, ~60 commits)
+
+No waxum source changes needed; build, clippy, and the full test suite
+pass unchanged against the new rev. Highlights relevant to this app:
+
+- **`fix(lifecycle): race the reconnect backoff against the terminal
+  shutdown` (#1179).** Previously `Client::disconnect()` did not wake an
+  in-progress reconnect backoff sleep — with the Fibonacci backoff capped
+  at 900s, a disconnect issued while the client was deep in that sleep
+  could take up to 15 minutes to actually take effect. This directly
+  strengthens [0.11.1]'s `run_reconnect_watchdog`: its forced-rebuild path
+  calls `client.disconnect().await` synchronously inside the watchdog's
+  poll loop, so before this upstream fix a wedged client could stall the
+  watchdog's checks for *every other session* for up to 15 minutes. Now
+  `disconnect()` returns promptly regardless of backoff state.
+- `feat(voip): add group calls and call links` (#1130).
+- `feat(download): allow media download without a connected session`
+  (#1194), plus `fix(download): guarantee download_to_writer leaves only
+  verified media` (#1197).
+- `fix(pair-code): keep a phone-number link alive past QR rotation`
+  (#1163), `fix(pair-code): read the companion_finish answer instead of
+  assuming it` (#1198), `feat(pair-code): report a refused pair-code
+  request to the consumer` (#1191).
+- `fix(appstate): let a diverged collection converge, and stop losing
+  409'd patches` (#1158).
+- A batch of JID/AD-JID identity fixes affecting device dedup (#1178,
+  #1182, #1184).
+- Numerous `perf(*)` commits (JID parsing, noise-frame coalescing,
+  per-message allocation cuts) — no behavior change expected.
+
 ## [0.11.2] - 2026-07-28
 
 ### Fixed — Docker: regression from the 0.11.0 non-root user broke upgrades
