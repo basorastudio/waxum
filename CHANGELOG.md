@@ -2,6 +2,29 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.2] - 2026-07-28
+
+### Fixed — Docker: regression from the 0.11.0 non-root user broke upgrades
+
+0.11.0 added a non-root `waxum` user (uid/gid 1000) to the Docker image
+(the OWASP hardening pass). That's correct for a *fresh* deployment, but
+broke every *existing* one: volumes created by pre-0.11.0 images (which
+ran as root) are owned by uid 0, and the new non-root process couldn't
+write to them — `attempt to write a readonly database` on the SQLite
+file, sessions unreadable.
+
+Fixed with the standard pattern for this exact problem (the same one
+Postgres/MySQL/Grafana's official images use): the container now starts
+as root, a new `docker-entrypoint.sh` `chown -R`s `WHATSAPP_STORAGE_PATH`
+(and the directory holding `SQLITE_PATH`, if that's set to somewhere
+else) so pre-existing root-owned volume contents become writable by
+`waxum` again, then drops privileges via `gosu waxum:waxum` before
+actually exec'ing the binary. The app process itself is still never
+root -- only the brief chown-on-start step is -- so this keeps the
+0.11.0 hardening intact while fixing the upgrade path. No action needed
+on existing deployments; pulling the new image and restarting the
+container self-heals the ownership.
+
 ## [0.11.1] - 2026-07-28
 
 ### Fixed — auto-reconnect actually re-establishes the socket, honest status, self-heal
