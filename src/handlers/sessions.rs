@@ -1553,6 +1553,54 @@ fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_json::Value
     serde_json::Value::Null
 }
 
+/// Typed counterpart to [`extract_media_metadata`] for message-history
+/// persistence ([`crate::handlers::search::record_incoming`] /
+/// `record_outgoing`): the same five media envelopes, but shaped as
+/// [`crate::db::messages::MediaPointer`] instead of a webhook JSON blob,
+/// and `None` when the message isn't media or is missing a field
+/// `/media/download` requires (an incomplete pointer is useless, so a
+/// message with one is stored with no media pointer at all rather than
+/// a partially-filled one).
+pub(crate) fn extract_media_pointer(
+    msg: &waproto::whatsapp::Message,
+) -> Option<crate::db::messages::MediaPointer> {
+    use base64::Engine as _;
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    macro_rules! pointer {
+        ($m:expr, $kind:literal) => {
+            Some(crate::db::messages::MediaPointer {
+                media_key: b64($m.media_key.as_ref()?),
+                file_sha256: b64($m.file_sha256.as_ref()?),
+                file_enc_sha256: b64($m.file_enc_sha256.as_ref()?),
+                direct_path: $m.direct_path.clone()?,
+                file_length: $m.file_length? as i64,
+                media_type: $kind.to_string(),
+                mimetype: $m.mimetype.clone().unwrap_or_default(),
+            })
+        };
+    }
+
+    if let Some(im) = msg.image_message.as_option() {
+        return pointer!(im, "image");
+    }
+    if let Some(vm) = msg.video_message.as_option() {
+        return pointer!(vm, "video");
+    }
+    if let Some(am) = msg.audio_message.as_option() {
+        return pointer!(am, "audio");
+    }
+    if let Some(dm) = msg.document_message.as_option() {
+        return pointer!(dm, "document");
+    }
+    if let Some(sm) = msg.sticker_message.as_option() {
+        return pointer!(sm, "sticker");
+    }
+    None
+}
+
 /// Extracts location data (lat/lng + optional name/address/url) from a
 /// LocationMessage / LiveLocationMessage when present. Returns null otherwise.
 fn extract_location(msg: &waproto::whatsapp::Message) -> serde_json::Value {

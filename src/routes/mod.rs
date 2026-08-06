@@ -270,6 +270,10 @@ fn session_routes() -> Router<AppState> {
             get(handlers::search::search_session_messages),
         )
         .route(
+            "/{session_id}/messages/chat/{chat_jid}",
+            get(handlers::search::list_chat_messages),
+        )
+        .route(
             "/{session_id}/messages/newsletter-forward",
             post(handlers::messages::send_newsletter_forward),
         )

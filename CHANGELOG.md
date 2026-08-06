@@ -2,7 +2,29 @@
 
 All notable changes to **waxum** will be documented in this file.
 
-## [0.11.4] - 2026-08-06
+## [0.11.5] - 2026-08-06
+
+### Added — `GET /sessions/{id}/messages/chat/{chat_jid}`
+
+A plain "show me this chat" read, the counterpart to
+`/messages/search` for callers that don't have (or don't want to
+require) a search term — built for the WhatsApp MCP server. Newest
+first, paginated (`limit`/`offset`), no query text required.
+
+- Each row now carries the sender's `push_name` (joined from
+  `contacts`) and, for media messages, a `media` download pointer
+  (`media_key`, `file_sha256`, `file_enc_sha256`, `direct_path`,
+  `file_length`, `media_type`, `mimetype`) shaped to pass straight
+  into `POST /media/download` with no re-encoding.
+- The `messages` table gained seven columns to make the media
+  pointer persistable — previously nothing about a media message's
+  download parameters survived past the original event, so a past
+  message was never downloadable again once the live event handler
+  moved on. Migrated across all three backends (SQLite 3.35+, Postgres,
+  MySQL), tolerant of already-migrated databases.
+- `/messages/search` is unchanged — its rows still carry `push_name:
+  null` and `media: null`; only the new chat-listing endpoint
+  populates them.
 
 ### Changed — bumped vendored `whatsapp-rust` (`13fce2f0` → `2b607618`, 9 commits)
 

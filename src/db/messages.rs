@@ -61,13 +61,41 @@ pub struct NewMessage {
     /// Searchable text: message body, or the caption for media.
     pub body: Option<String>,
     pub msg_timestamp: chrono::DateTime<chrono::Utc>,
+    /// Download pointers for media message types, `None` for
+    /// text/location/contact/etc. All base64-encoded except
+    /// `direct_path`, `media_type`, and `mimetype` — the same shapes
+    /// [`crate::models::media::DownloadMediaRequest`] expects, so a
+    /// caller can round-trip these fields straight into
+    /// `POST /media/download` with no re-encoding.
+    pub media: Option<MediaPointer>,
 }
 
-/// A `messages` row as returned by search, timestamps rendered as
-/// `%Y-%m-%d %H:%M:%S` UTC text regardless of backend. `snippet` is
-/// only populated by backends with cheap highlight support (SQLite
-/// FTS5, Postgres).
-#[derive(Debug, Clone)]
+/// Download pointer for one media message, captured at ingestion time
+/// since `/media/download` needs the encryption key and hashes that
+/// only exist on the original message — they are never re-derivable
+/// from a stored history row otherwise.
+#[derive(Debug, Clone, Default)]
+pub struct MediaPointer {
+    pub media_key: String,
+    pub file_sha256: String,
+    pub file_enc_sha256: String,
+    pub direct_path: String,
+    pub file_length: i64,
+    /// One of `image`, `video`, `audio`, `document`, `sticker` —
+    /// matches `crate::models::media::MediaType`'s snake_case wire
+    /// form.
+    pub media_type: String,
+    pub mimetype: String,
+}
+
+/// A `messages` row as returned by search or chat listing, timestamps
+/// rendered as `%Y-%m-%d %H:%M:%S` UTC text regardless of backend.
+/// `snippet` is only populated by backends with cheap highlight
+/// support (SQLite FTS5, Postgres) and only by [`search`]. `media` and
+/// `push_name` are only populated by [`list_by_chat`] — `search`'s
+/// queries don't select those columns, so its rows always carry
+/// `None` there.
+#[derive(Debug, Clone, Default)]
 pub struct MessageRow {
     pub id: i64,
     pub message_id: String,
@@ -79,6 +107,8 @@ pub struct MessageRow {
     pub body: Option<String>,
     pub msg_timestamp: String,
     pub snippet: Option<String>,
+    pub media: Option<MediaPointer>,
+    pub push_name: Option<String>,
 }
 
 /// Store one message, ignoring duplicates on `(session_id,
@@ -87,12 +117,21 @@ pub struct MessageRow {
 /// when the row was actually new; FTS-insert errors are swallowed so a
 /// broken index never blocks ingestion.
 pub async fn insert(pool: &DbPool, msg: &NewMessage) -> anyhow::Result<()> {
+    let media = msg.media.as_ref();
+    let media_key = media.map(|m| m.media_key.as_str());
+    let file_sha256 = media.map(|m| m.file_sha256.as_str());
+    let file_enc_sha256 = media.map(|m| m.file_enc_sha256.as_str());
+    let direct_path = media.map(|m| m.direct_path.as_str());
+    let file_length = media.map(|m| m.file_length);
+    let media_type = media.map(|m| m.media_type.as_str());
+    let mimetype = media.map(|m| m.mimetype.as_str());
+
     match pool {
         DbPool::Postgres(pg) => {
             let client = pg.get().await?;
             client
                 .execute(
-                    "INSERT INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id, message_id) DO NOTHING",
+                    "INSERT INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp, media_key, file_sha256, file_enc_sha256, direct_path, file_length, media_type, mimetype) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (session_id, message_id) DO NOTHING",
                     &[
                         &msg.message_id,
                         &msg.session_id,
@@ -102,28 +141,44 @@ pub async fn insert(pool: &DbPool, msg: &NewMessage) -> anyhow::Result<()> {
                         &msg.msg_type,
                         &msg.body,
                         &msg.msg_timestamp,
+                        &media_key,
+                        &file_sha256,
+                        &file_enc_sha256,
+                        &direct_path,
+                        &file_length,
+                        &media_type,
+                        &mimetype,
                     ],
                 )
                 .await?;
         }
         DbPool::MySQL(my) => {
             use mysql_async::prelude::*;
+            use mysql_async::Value as MyValue;
             let mut conn = my.get_conn().await?;
             let ts = fmt_utc(msg.msg_timestamp);
             let now = now_str();
+            let params: Vec<MyValue> = vec![
+                msg.message_id.clone().into(),
+                msg.session_id.clone().into(),
+                msg.chat_jid.clone().into(),
+                msg.sender_jid.clone().into(),
+                msg.direction.clone().into(),
+                msg.msg_type.clone().into(),
+                msg.body.clone().into(),
+                ts.into(),
+                now.into(),
+                media_key.map(str::to_string).into(),
+                file_sha256.map(str::to_string).into(),
+                file_enc_sha256.map(str::to_string).into(),
+                direct_path.map(str::to_string).into(),
+                file_length.into(),
+                media_type.map(str::to_string).into(),
+                mimetype.map(str::to_string).into(),
+            ];
             conn.exec_drop(
-                "INSERT IGNORE INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    &msg.message_id,
-                    &msg.session_id,
-                    &msg.chat_jid,
-                    &msg.sender_jid,
-                    &msg.direction,
-                    &msg.msg_type,
-                    msg.body.as_deref(),
-                    ts,
-                    now,
-                ),
+                "INSERT IGNORE INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp, created_at, media_key, file_sha256, file_enc_sha256, direct_path, file_length, media_type, mimetype) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                mysql_async::Params::Positional(params),
             )
             .await?;
         }
@@ -131,10 +186,20 @@ pub async fn insert(pool: &DbPool, msg: &NewMessage) -> anyhow::Result<()> {
             let m = msg.clone();
             let ts = fmt_utc(m.msg_timestamp);
             let now = now_str();
+            let media_key = media_key.map(str::to_string);
+            let file_sha256 = file_sha256.map(str::to_string);
+            let file_enc_sha256 = file_enc_sha256.map(str::to_string);
+            let direct_path = direct_path.map(str::to_string);
+            let media_type = media_type.map(str::to_string);
+            let mimetype = mimetype.map(str::to_string);
             sqlite_blocking(handle, move |conn| {
+                let file_length_value = match file_length {
+                    Some(n) => SQ::Int(n),
+                    None => SQ::Null,
+                };
                 let changed = sqlite_raw::execute(
                     conn,
-                    "INSERT OR IGNORE INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO messages (message_id, session_id, chat_jid, sender_jid, direction, msg_type, body, msg_timestamp, created_at, media_key, file_sha256, file_enc_sha256, direct_path, file_length, media_type, mimetype) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     &[
                         SQ::Text(m.message_id.clone()),
                         SQ::Text(m.session_id.clone()),
@@ -145,6 +210,13 @@ pub async fn insert(pool: &DbPool, msg: &NewMessage) -> anyhow::Result<()> {
                         SQ::from_opt_str(m.body.as_deref()),
                         SQ::Text(ts),
                         SQ::Text(now),
+                        SQ::from_opt_str(media_key.as_deref()),
+                        SQ::from_opt_str(file_sha256.as_deref()),
+                        SQ::from_opt_str(file_enc_sha256.as_deref()),
+                        SQ::from_opt_str(direct_path.as_deref()),
+                        file_length_value,
+                        SQ::from_opt_str(media_type.as_deref()),
+                        SQ::from_opt_str(mimetype.as_deref()),
                     ],
                 )?;
                 if changed > 0 {
@@ -280,6 +352,61 @@ pub async fn search(
     }
 }
 
+/// List one chat's history, newest first, no search term required —
+/// the counterpart to [`search`] for a plain "show me this chat"
+/// read. Rows carry the media download pointer (when the message was
+/// media) and the sender's `push_name` via a `LEFT JOIN` against
+/// `contacts`, both `None`/absent from [`search`]'s rows.
+///
+/// Every column across the join is qualified (`m.`/`c.`) even though
+/// today's `contacts`/`messages` schemas don't collide outside
+/// `session_id` — the FTS join already bit this project once with an
+/// "ambiguous column name" failure (see `tests/fts_probe.rs`), so new
+/// joins qualify unconditionally rather than relying on the current
+/// column set staying disjoint.
+pub async fn list_by_chat(
+    pool: &DbPool,
+    session_id: &str,
+    chat_jid: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<MessageRow>> {
+    let session_id = session_id.to_string();
+    let chat_jid = chat_jid.to_string();
+    match pool {
+        DbPool::Postgres(pg) => {
+            let client = pg.get().await?;
+            let sql = "SELECT m.id, m.message_id, m.session_id, m.chat_jid, m.sender_jid, m.direction, m.msg_type, m.body, m.msg_timestamp, m.media_key, m.file_sha256, m.file_enc_sha256, m.direct_path, m.file_length, m.media_type, m.mimetype, c.push_name FROM messages m LEFT JOIN contacts c ON c.session_id = m.session_id AND c.jid = m.sender_jid WHERE m.session_id = $1 AND m.chat_jid = $2 ORDER BY m.msg_timestamp DESC, m.id DESC LIMIT $3 OFFSET $4";
+            let rows = client
+                .query(sql, &[&session_id, &chat_jid, &limit, &offset])
+                .await?;
+            Ok(rows.iter().map(pg_row_to_chat_message).collect())
+        }
+        DbPool::MySQL(my) => {
+            use mysql_async::prelude::*;
+            let mut conn = my.get_conn().await?;
+            let sql = "SELECT m.id, m.message_id, m.session_id, m.chat_jid, m.sender_jid, m.direction, m.msg_type, m.body, m.msg_timestamp, m.media_key, m.file_sha256, m.file_enc_sha256, m.direct_path, m.file_length, m.media_type, m.mimetype, c.push_name FROM messages m LEFT JOIN contacts c ON c.session_id = m.session_id AND c.jid = m.sender_jid WHERE m.session_id = ? AND m.chat_jid = ? ORDER BY m.msg_timestamp DESC, m.id DESC LIMIT ? OFFSET ?";
+            let rows: Vec<mysql_async::Row> = conn
+                .exec(sql, (session_id, chat_jid, limit, offset))
+                .await?;
+            Ok(rows.iter().map(my_row_to_chat_message).collect())
+        }
+        DbPool::SQLite(handle) => {
+            let sql = "SELECT m.id, m.message_id, m.session_id, m.chat_jid, m.sender_jid, m.direction, m.msg_type, m.body, m.msg_timestamp, m.media_key, m.file_sha256, m.file_enc_sha256, m.direct_path, m.file_length, m.media_type, m.mimetype, c.push_name FROM messages m LEFT JOIN contacts c ON c.session_id = m.session_id AND c.jid = m.sender_jid WHERE m.session_id = ? AND m.chat_jid = ? ORDER BY m.msg_timestamp DESC, m.id DESC LIMIT ? OFFSET ?";
+            let values = vec![
+                SQ::Text(session_id),
+                SQ::Text(chat_jid),
+                SQ::Int(limit),
+                SQ::Int(offset),
+            ];
+            sqlite_blocking(handle, move |conn| {
+                sqlite_raw::query(conn, sql, &values, sqlite_row_to_chat_message)
+            })
+            .await
+        }
+    }
+}
+
 /// Postgres ILIKE fallback, broken out because the primary path borrows
 /// the pooled client already.
 async fn pg_search_ilike(
@@ -388,6 +515,36 @@ fn pg_row_to_message(row: &tokio_postgres::Row) -> MessageRow {
         body: row.get("body"),
         msg_timestamp: fmt_utc(row.get::<_, chrono::DateTime<chrono::Utc>>("msg_timestamp")),
         snippet: row.get("snippet"),
+        media: None,
+        push_name: None,
+    }
+}
+
+fn pg_row_to_chat_message(row: &tokio_postgres::Row) -> MessageRow {
+    let media = row
+        .get::<_, Option<String>>("media_key")
+        .map(|media_key| MediaPointer {
+            media_key,
+            file_sha256: row.get("file_sha256"),
+            file_enc_sha256: row.get("file_enc_sha256"),
+            direct_path: row.get("direct_path"),
+            file_length: row.get::<_, Option<i64>>("file_length").unwrap_or(0),
+            media_type: row.get("media_type"),
+            mimetype: row.get("mimetype"),
+        });
+    MessageRow {
+        id: row.get("id"),
+        message_id: row.get("message_id"),
+        session_id: row.get("session_id"),
+        chat_jid: row.get("chat_jid"),
+        sender_jid: row.get("sender_jid"),
+        direction: row.get("direction"),
+        msg_type: row.get("msg_type"),
+        body: row.get("body"),
+        msg_timestamp: fmt_utc(row.get::<_, chrono::DateTime<chrono::Utc>>("msg_timestamp")),
+        snippet: None,
+        media,
+        push_name: row.get("push_name"),
     }
 }
 
@@ -402,14 +559,16 @@ fn my_get_string(row: &mysql_async::Row, col: &str) -> Option<String> {
 }
 
 fn my_get_i64(row: &mysql_async::Row, col: &str) -> i64 {
+    my_get_opt_i64(row, col).unwrap_or(0)
+}
+
+fn my_get_opt_i64(row: &mysql_async::Row, col: &str) -> Option<i64> {
     use mysql_async::Value;
-    let Some(idx) = row.columns_ref().iter().position(|c| c.name_str() == col) else {
-        return 0;
-    };
-    match row.as_ref(idx) {
-        Some(Value::Int(i)) => *i,
-        Some(Value::UInt(u)) => *u as i64,
-        _ => 0,
+    let idx = row.columns_ref().iter().position(|c| c.name_str() == col)?;
+    match row.as_ref(idx)? {
+        Value::Int(i) => Some(*i),
+        Value::UInt(u) => Some(*u as i64),
+        _ => None,
     }
 }
 
@@ -425,6 +584,34 @@ fn my_row_to_message(row: &mysql_async::Row) -> MessageRow {
         body: my_get_string(row, "body"),
         msg_timestamp: my_get_string(row, "msg_timestamp").unwrap_or_default(),
         snippet: my_get_string(row, "snippet"),
+        media: None,
+        push_name: None,
+    }
+}
+
+fn my_row_to_chat_message(row: &mysql_async::Row) -> MessageRow {
+    let media = my_get_string(row, "media_key").map(|media_key| MediaPointer {
+        media_key,
+        file_sha256: my_get_string(row, "file_sha256").unwrap_or_default(),
+        file_enc_sha256: my_get_string(row, "file_enc_sha256").unwrap_or_default(),
+        direct_path: my_get_string(row, "direct_path").unwrap_or_default(),
+        file_length: my_get_opt_i64(row, "file_length").unwrap_or(0),
+        media_type: my_get_string(row, "media_type").unwrap_or_default(),
+        mimetype: my_get_string(row, "mimetype").unwrap_or_default(),
+    });
+    MessageRow {
+        id: my_get_i64(row, "id"),
+        message_id: my_get_string(row, "message_id").unwrap_or_default(),
+        session_id: my_get_string(row, "session_id").unwrap_or_default(),
+        chat_jid: my_get_string(row, "chat_jid").unwrap_or_default(),
+        sender_jid: my_get_string(row, "sender_jid").unwrap_or_default(),
+        direction: my_get_string(row, "direction").unwrap_or_default(),
+        msg_type: my_get_string(row, "msg_type").unwrap_or_default(),
+        body: my_get_string(row, "body"),
+        msg_timestamp: my_get_string(row, "msg_timestamp").unwrap_or_default(),
+        snippet: None,
+        media,
+        push_name: my_get_string(row, "push_name"),
     }
 }
 
@@ -440,5 +627,36 @@ fn sqlite_row_to_message(row: &sqlite_raw::Row) -> MessageRow {
         body: row.get_string(7),
         msg_timestamp: row.get_string(8).unwrap_or_default(),
         snippet: row.get_string(9),
+        media: None,
+        push_name: None,
+    }
+}
+
+/// Row shape for [`list_by_chat`]: the plain message columns (0-8),
+/// the seven media pointer columns (9-15), then `push_name` from the
+/// `contacts` join (16).
+fn sqlite_row_to_chat_message(row: &sqlite_raw::Row) -> MessageRow {
+    let media = row.get_string(9).map(|media_key| MediaPointer {
+        media_key,
+        file_sha256: row.get_string(10).unwrap_or_default(),
+        file_enc_sha256: row.get_string(11).unwrap_or_default(),
+        direct_path: row.get_string(12).unwrap_or_default(),
+        file_length: row.get_int(13),
+        media_type: row.get_string(14).unwrap_or_default(),
+        mimetype: row.get_string(15).unwrap_or_default(),
+    });
+    MessageRow {
+        id: row.get_int(0),
+        message_id: row.get_string(1).unwrap_or_default(),
+        session_id: row.get_string(2).unwrap_or_default(),
+        chat_jid: row.get_string(3).unwrap_or_default(),
+        sender_jid: row.get_string(4).unwrap_or_default(),
+        direction: row.get_string(5).unwrap_or_default(),
+        msg_type: row.get_string(6).unwrap_or_default(),
+        body: row.get_string(7),
+        msg_timestamp: row.get_string(8).unwrap_or_default(),
+        snippet: None,
+        media,
+        push_name: row.get_string(16),
     }
 }

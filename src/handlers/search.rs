@@ -27,10 +27,12 @@ use axum::{
 };
 use wacore_binary::jid::Jid;
 
-use crate::db::messages::{self, MessageRow, NewMessage};
+use crate::db::messages::{self, MediaPointer, MessageRow, NewMessage};
 use crate::error::ApiError;
+use crate::models::media::MediaType;
 use crate::models::search::{
-    MessageFleetSearchQuery, MessageHit, MessageSearchQuery, MessageSearchResponse,
+    ChatMessagesQuery, MessageFleetSearchQuery, MessageHit, MessageMedia, MessageSearchQuery,
+    MessageSearchResponse,
 };
 use crate::state::AppState;
 
@@ -74,6 +76,7 @@ pub(crate) async fn record_incoming(
         msg_type,
         body: text.or(caption),
         msg_timestamp: info.timestamp,
+        media: crate::handlers::sessions::extract_media_pointer(msg),
     };
     if let Err(e) = messages::insert(state.session_manager().pool(), &row).await {
         tracing::warn!("message history insert (incoming) failed: {}", e);
@@ -103,6 +106,7 @@ pub(crate) async fn record_outgoing(
         msg_type,
         body: text.or(caption),
         msg_timestamp: chrono::Utc::now(),
+        media: crate::handlers::sessions::extract_media_pointer(message),
     };
     if let Err(e) = messages::insert(state.session_manager().pool(), &row).await {
         tracing::warn!("message history insert (outgoing) failed: {}", e);
@@ -185,6 +189,63 @@ pub async fn search_all_messages(
     Ok(Json(rows_to_response(rows)))
 }
 
+#[utoipa::path(
+    get,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/messages/chat/{chat_jid}",
+    tag = "messages",
+    params(
+        ("session_id" = String, Path, description = "Session ID"),
+        ("chat_jid" = String, Path, description = "Chat JID (DM partner or group JID)"),
+        ChatMessagesQuery,
+    ),
+    responses(
+        (status = 200, description = "This chat's history, newest first, with sender push_name and any media download pointer", body = MessageSearchResponse),
+        (status = 404, description = "Session not found")
+    )
+)]
+pub async fn list_chat_messages(
+    State(state): State<AppState>,
+    Path((session_id, chat_jid)): Path<(String, String)>,
+    Query(q): Query<ChatMessagesQuery>,
+) -> Result<Json<MessageSearchResponse>, ApiError> {
+    if state.get_session(&session_id).is_none() {
+        return Err(ApiError::SessionNotFound(session_id));
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let rows = messages::list_by_chat(
+        state.session_manager().pool(),
+        &session_id,
+        &chat_jid,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows_to_response(rows)))
+}
+
+fn media_pointer_to_model(m: &MediaPointer) -> Option<MessageMedia> {
+    let media_type = match m.media_type.as_str() {
+        "image" => MediaType::Image,
+        "video" => MediaType::Video,
+        "audio" => MediaType::Audio,
+        "document" => MediaType::Document,
+        "sticker" => MediaType::Sticker,
+        _ => return None,
+    };
+    Some(MessageMedia {
+        direct_path: m.direct_path.clone(),
+        media_key: m.media_key.clone(),
+        file_sha256: m.file_sha256.clone(),
+        file_enc_sha256: m.file_enc_sha256.clone(),
+        file_length: m.file_length.max(0) as u64,
+        media_type,
+        mimetype: m.mimetype.clone(),
+    })
+}
+
 fn rows_to_response(rows: Vec<MessageRow>) -> MessageSearchResponse {
     let messages: Vec<MessageHit> = rows
         .iter()
@@ -199,6 +260,8 @@ fn rows_to_response(rows: Vec<MessageRow>) -> MessageSearchResponse {
             body: r.body.clone(),
             snippet: r.snippet.clone(),
             msg_timestamp: r.msg_timestamp.clone(),
+            push_name: r.push_name.clone(),
+            media: r.media.as_ref().and_then(media_pointer_to_model),
         })
         .collect();
     MessageSearchResponse {
