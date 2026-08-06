@@ -2,6 +2,36 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.4] - 2026-08-06
+
+### Changed — bumped vendored `whatsapp-rust` (`13fce2f0` → `2b607618`, 9 commits)
+
+No waxum source changes needed; build, clippy, and the full test suite
+pass unchanged against the new rev. Highlights:
+
+- **`fix(appstate): unbreak the bootstrap gate and read the right lifecycle
+  signals` (#1208).** The largest change in this batch — reworks
+  `Client`'s lifecycle signaling. Introduces `is_terminal()`, which finally
+  separates "this connection ended" from "this client is done for good"
+  (the old `is_shutting_down` conflated both, so code waiting across a
+  reconnect could give up right when the replacement connection was about
+  to land). Adds a `session_state_notifier` so anything parked waiting on
+  connection state wakes promptly on every terminal transition, and an
+  `authenticated_generation` guard so a request can't be admitted under a
+  connection generation that's already been retired.
+- `fix(appstate): report what a batched sync actually achieved` (#1207) —
+  batched appstate sync now reports its real outcome instead of assuming
+  success.
+- `fix(appstate): reserve the collection for an AppStateSync task` (#1205).
+- `fix(history-sync): match our own pushname entry by JID user` (#1203).
+- `fix(libsignal): keep skipped message-key seeds projectable` (#1210) —
+  ratchet/session-state fix around skipped message keys.
+- `feat(libsignal): let a consumer opt out of counter leasing` (#1211).
+- `bench(libsignal): sender-key XEdDSA memo benchmark` (#1212) — bench
+  only, no behavior change.
+- `ci(test): run the suites through cargo-nextest` (#1209) — upstream CI
+  only, not applicable here.
+
 ## [0.11.3] - 2026-07-31
 
 ### Changed — bumped vendored `whatsapp-rust` (`dde51e7a` → `13fce2f0`, ~60 commits)
