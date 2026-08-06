@@ -242,6 +242,7 @@ use state::AppState;
 
         handlers::search::search_session_messages,
         handlers::search::search_all_messages,
+        handlers::search::list_chat_messages,
 
         handlers::tokens::mint_token,
         handlers::tokens::list_tokens,
@@ -415,6 +416,7 @@ use state::AppState;
             models::blast::BlastRecipientListResponse,
 
             models::search::MessageHit,
+            models::search::MessageMedia,
             models::search::MessageSearchResponse,
 
             models::common::SuccessResponse,

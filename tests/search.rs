@@ -12,7 +12,8 @@ use chrono::{Duration, Utc};
 use common::{call, req_get, req_json, Harness, TEST_TOKEN};
 use serde_json::json;
 
-use waxum::db::messages::{insert, NewMessage};
+use waxum::db::contacts::{ContactStore, ContactUpsert};
+use waxum::db::messages::{insert, MediaPointer, NewMessage};
 
 async fn seed_session(h: &Harness, id: &str) {
     let (status, _) = call(
@@ -49,6 +50,7 @@ fn msg(
         msg_type: msg_type.to_string(),
         body: body.map(str::to_string),
         msg_timestamp: ts,
+        media: None,
     }
 }
 
@@ -362,6 +364,71 @@ async fn special_match_syntax_in_query_does_not_error() {
         .await;
         assert_eq!(status, StatusCode::OK, "query {q} should not error");
     }
+}
+
+#[tokio::test]
+async fn chat_listing_includes_push_name_and_media_pointer() {
+    let h = Harness::new().await;
+    seed_session(&h, "search-s-08").await;
+
+    ContactStore::new(&h.pool)
+        .upsert(&ContactUpsert {
+            session_id: "search-s-08",
+            jid: "559999999999@s.whatsapp.net",
+            push_name: Some("Jane Doe"),
+            source: "message",
+            ..Default::default()
+        })
+        .await
+        .expect("contact upsert");
+
+    let mut text_row = msg(
+        "MID-C1",
+        "search-s-08",
+        "in",
+        "text",
+        Some("hey there"),
+        ts(2),
+    );
+    text_row.chat_jid = "120000000000000000@g.us".to_string();
+    insert(&h.pool, &text_row).await.expect("insert");
+
+    let mut image_row = msg("MID-C2", "search-s-08", "in", "image", None, ts(1));
+    image_row.chat_jid = "120000000000000000@g.us".to_string();
+    image_row.media = Some(MediaPointer {
+        media_key: "a2V5".to_string(),
+        file_sha256: "c2hh".to_string(),
+        file_enc_sha256: "ZW5j".to_string(),
+        direct_path: "/v/t/abc".to_string(),
+        file_length: 1234,
+        media_type: "image".to_string(),
+        mimetype: "image/jpeg".to_string(),
+    });
+    insert(&h.pool, &image_row).await.expect("insert");
+
+    let (status, body) = call(
+        &h.app,
+        req_get(
+            "/api/v1/sessions/search-s-08/messages/chat/120000000000000000@g.us",
+            Some(TEST_TOKEN),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2);
+    let hits = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(hits[0]["message_id"], "MID-C2");
+    assert_eq!(hits[0]["push_name"], "Jane Doe");
+    assert_eq!(hits[0]["media"]["media_key"], "a2V5");
+    assert_eq!(hits[0]["media"]["file_sha256"], "c2hh");
+    assert_eq!(hits[0]["media"]["direct_path"], "/v/t/abc");
+    assert_eq!(hits[0]["media"]["file_length"], 1234);
+    assert_eq!(hits[0]["media"]["media_type"], "image");
+
+    assert_eq!(hits[1]["message_id"], "MID-C1");
+    assert_eq!(hits[1]["push_name"], "Jane Doe");
+    assert_eq!(hits[1]["media"], serde_json::Value::Null);
 }
 
 fn urlencoding(s: &str) -> String {

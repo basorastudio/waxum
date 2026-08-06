@@ -8,6 +8,12 @@ pub async fn init_schema(pool: &DbPool) -> anyhow::Result<()> {
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
+/// exists, so columns added to `messages` after a DB was first
+/// created (the media pointer + push-name join fields) need an
+/// explicit `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` per column,
+/// each run independently so an already-present column never aborts
+/// the rest. Mirrors the tolerant migration list [`init_mysql`] runs.
 async fn init_sqlite(pool: &crate::db::session::SqlitePool) -> anyhow::Result<()> {
     use crate::db::sqlite_raw;
     sqlite_blocking(pool, |conn| {
@@ -125,6 +131,13 @@ async fn init_sqlite(pool: &crate::db::session::SqlitePool) -> anyhow::Result<()
                 body TEXT, \
                 msg_timestamp TEXT NOT NULL, \
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')), \
+                media_key TEXT, \
+                file_sha256 TEXT, \
+                file_enc_sha256 TEXT, \
+                direct_path TEXT, \
+                file_length INTEGER, \
+                media_type TEXT, \
+                mimetype TEXT, \
                 UNIQUE (session_id, message_id) \
              ); \
              CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, msg_timestamp); \
@@ -145,6 +158,17 @@ async fn init_sqlite(pool: &crate::db::session::SqlitePool) -> anyhow::Result<()
              ); \
              CREATE INDEX IF NOT EXISTS idx_token_sessions_session ON token_sessions(session_id);",
         )?;
+        for sql in [
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_key TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_sha256 TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_enc_sha256 TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS direct_path TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_length INTEGER",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS mimetype TEXT",
+        ] {
+            let _ = sqlite_raw::exec_batch(conn, sql);
+        }
         if let Err(e) = sqlite_raw::exec_batch(
             conn,
             "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(body, session_id UNINDEXED, message_id UNINDEXED);",
@@ -396,6 +420,17 @@ async fn init_postgres(pool: &deadpool_postgres::Pool) -> anyhow::Result<()> {
             &[],
         )
         .await?;
+    for sql in [
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_key TEXT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_sha256 TEXT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_enc_sha256 TEXT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS direct_path TEXT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_length BIGINT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS mimetype TEXT",
+    ] {
+        let _ = client.execute(sql, &[]).await;
+    }
     client
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, msg_timestamp)",
@@ -610,6 +645,13 @@ async fn init_mysql(pool: &mysql_async::Pool) -> anyhow::Result<()> {
             body TEXT NULL,
             msg_timestamp VARCHAR(30) NOT NULL,
             created_at VARCHAR(30) NOT NULL DEFAULT '1970-01-01 00:00:00',
+            media_key TEXT NULL,
+            file_sha256 TEXT NULL,
+            file_enc_sha256 TEXT NULL,
+            direct_path TEXT NULL,
+            file_length BIGINT NULL,
+            media_type VARCHAR(16) NULL,
+            mimetype VARCHAR(255) NULL,
             UNIQUE KEY uniq_messages_id (session_id, message_id),
             INDEX idx_messages_session_ts (session_id, msg_timestamp),
             INDEX idx_messages_chat (session_id, chat_jid),
@@ -664,6 +706,13 @@ async fn init_mysql(pool: &mysql_async::Pool) -> anyhow::Result<()> {
         "ALTER TABLE contacts MODIFY COLUMN push_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NULL",
         "ALTER TABLE contacts MODIFY COLUMN business_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NULL",
         "ALTER TABLE contacts MODIFY COLUMN source VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE messages ADD COLUMN media_key TEXT NULL",
+        "ALTER TABLE messages ADD COLUMN file_sha256 TEXT NULL",
+        "ALTER TABLE messages ADD COLUMN file_enc_sha256 TEXT NULL",
+        "ALTER TABLE messages ADD COLUMN direct_path TEXT NULL",
+        "ALTER TABLE messages ADD COLUMN file_length BIGINT NULL",
+        "ALTER TABLE messages ADD COLUMN media_type VARCHAR(16) NULL",
+        "ALTER TABLE messages ADD COLUMN mimetype VARCHAR(255) NULL",
     ];
     for sql in &migrations {
         let _ = conn.query_drop(*sql).await;

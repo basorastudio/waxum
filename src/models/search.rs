@@ -10,6 +10,23 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::models::media::MediaType;
+
+/// Download pointer for a media message, shaped to be passed straight
+/// into `POST /sessions/{session_id}/media/download` as-is (same field
+/// names and encodings as
+/// [`crate::models::media::DownloadMediaRequest`]).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MessageMedia {
+    pub direct_path: String,
+    pub media_key: String,
+    pub file_sha256: String,
+    pub file_enc_sha256: String,
+    pub file_length: u64,
+    pub media_type: MediaType,
+    pub mimetype: String,
+}
+
 /// One message matched by search, newest first.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MessageHit {
@@ -54,6 +71,17 @@ pub struct MessageHit {
     /// Message time as `%Y-%m-%d %H:%M:%S` UTC text.
     #[schema(example = "2026-07-21 10:30:00")]
     pub msg_timestamp: String,
+
+    /// Sender's WhatsApp display name, from the `contacts` table.
+    /// Only populated by `GET /messages/chat/{chat_jid}` — always
+    /// `null` from `/messages/search`.
+    #[schema(example = "Jane Doe")]
+    pub push_name: Option<String>,
+
+    /// Download pointer, present when `msg_type` is a media type.
+    /// Only populated by `GET /messages/chat/{chat_jid}` — always
+    /// `null` from `/messages/search`.
+    pub media: Option<MessageMedia>,
 }
 
 /// Search result page.
@@ -73,6 +101,16 @@ pub struct MessageSearchQuery {
     /// via the backend's full-text index (LIKE fallback).
     pub q: String,
 
+    /// Page size (default 20, max 200).
+    pub limit: Option<i64>,
+
+    /// Rows to skip (default 0).
+    pub offset: Option<i64>,
+}
+
+/// Query params for `GET /api/v1/sessions/{session_id}/messages/chat/{chat_jid}`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ChatMessagesQuery {
     /// Page size (default 20, max 200).
     pub limit: Option<i64>,
 
