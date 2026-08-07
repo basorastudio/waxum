@@ -2,6 +2,18 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [0.11.6] - 2026-08-07
+
+### Changed
+
+Bumped the vendored `whatsapp-rust` (and `wacore`/`waproto`/etc.) git
+rev to `f8165f28` (upstream `0.7.0`) — 11 commits: binary-wire decode
+perf work (packed-value unpacking, node fan-out allocations, wire-path
+validation reuse), two new opt-in libsignal hooks (prewarming the
+sender-key derivation memo, supplying a custom X25519 agreement), plus
+tests/benches/docs. No API break, no waxum source changes required —
+`cargo build`/`clippy`/`test` all pass unmodified against the bump.
+
 ## [0.11.5] - 2026-08-06
 
 ### Added — `GET /sessions/{id}/messages/chat/{chat_jid}`
