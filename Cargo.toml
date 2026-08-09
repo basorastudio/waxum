@@ -10,13 +10,13 @@ repository = "https://github.com/imtaqin/waxum"
 [dependencies]
 
 rand = "0.8"
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222", default-features = true, features = ["voip", "tracing"] }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
-whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
-whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f8165f282008935732e0b26d6f5cca5038ecd222" }
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c", default-features = true, features = ["voip", "tracing"] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
+whatsapp-rust-sqlite-storage = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "5e084b9ba26bab12e22f8084843e225a5dc1bd3c" }
 
 # Web framework
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }

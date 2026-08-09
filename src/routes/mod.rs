@@ -12,7 +12,7 @@
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 
@@ -406,8 +406,101 @@ fn session_routes() -> Router<AppState> {
             "/{session_id}/privacy/settings",
             get(handlers::privacy::get_privacy_settings),
         )
-        .route("/{session_id}/mex/query", post(handlers::mex::mex_query))
-        .route("/{session_id}/mex/mutate", post(handlers::mex::mex_mutate))
+        .route(
+            "/{session_id}/business/catalog",
+            get(handlers::business::get_catalog),
+        )
+        .route(
+            "/{session_id}/business/collections",
+            get(handlers::business::get_collections),
+        )
+        .route(
+            "/{session_id}/business/order",
+            get(handlers::business::get_order),
+        )
+        .route(
+            "/{session_id}/business/profile",
+            patch(handlers::business::update_business_profile),
+        )
+        .route(
+            "/{session_id}/business/cover-photo/{photo_id}",
+            delete(handlers::business::remove_cover_photo),
+        )
+        .route(
+            "/{session_id}/newsletters/subscribed",
+            get(handlers::newsletter::list_subscribed),
+        )
+        .route(
+            "/{session_id}/newsletters",
+            post(handlers::newsletter::create_newsletter),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/metadata",
+            get(handlers::newsletter::get_metadata),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/join",
+            post(handlers::newsletter::join_newsletter),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/leave",
+            post(handlers::newsletter::leave_newsletter),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}",
+            delete(handlers::newsletter::delete_newsletter),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/change-owner",
+            post(handlers::newsletter::change_owner),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/demote",
+            post(handlers::newsletter::demote_admin),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/admin-info",
+            get(handlers::newsletter::get_admin_info),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/followers",
+            get(handlers::newsletter::get_followers),
+        )
+        .route(
+            "/{session_id}/newsletters/{jid}/mute",
+            post(handlers::newsletter::set_mute),
+        )
+        .route("/{session_id}/labels", post(handlers::labels::create_label))
+        .route(
+            "/{session_id}/labels/{label_id}",
+            delete(handlers::labels::delete_label),
+        )
+        .route(
+            "/{session_id}/labels/{label_id}/chats/{chat_jid}",
+            post(handlers::labels::add_chat_label).delete(handlers::labels::remove_chat_label),
+        )
+        .route(
+            "/{session_id}/labels/{label_id}/messages",
+            post(handlers::labels::add_message_label),
+        )
+        .route(
+            "/{session_id}/labels/{label_id}/messages/remove",
+            post(handlers::labels::remove_message_label),
+        )
+        .route(
+            "/{session_id}/quick-replies",
+            put(handlers::labels::set_quick_reply),
+        )
+        .route(
+            "/{session_id}/quick-replies/{id}",
+            delete(handlers::labels::delete_quick_reply),
+        )
+        .route(
+            "/{session_id}/settings/link-previews",
+            post(handlers::labels::set_link_previews),
+        )
+        .route("/{session_id}/bots", get(handlers::bots::list_bots))
+        .route("/{session_id}/capping", get(handlers::bots::get_capping))
         .route(
             "/{session_id}/spam/report",
             post(handlers::operations::spam_report),
