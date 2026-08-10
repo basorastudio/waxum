@@ -43,6 +43,11 @@
 //! - `RECONNECT_MAX_STUCK_SECS` — seconds a session may sit in
 //!   `Connecting` before the watchdog forces a rebuild, regardless of the
 //!   attempt count (default 600).
+//! - `ACCOUNT_LOCK_BACKOFF_SECS` — comma-separated cooldown schedule
+//!   applied when WhatsApp locks an account (`AccountLocked`); each
+//!   repeat lock walks one step further (default `300,900,3600`, i.e.
+//!   5 → 15 → 60 min). A manual `POST /sessions/:id/connect` lifts the
+//!   cooldown.
 //!
 //! ## Storage
 //!
@@ -223,6 +228,8 @@ use state::AppState;
         handlers::webhooks::register_webhook,
         handlers::webhooks::unregister_webhook,
         handlers::webhooks::reenable_webhook,
+        handlers::webhooks::list_webhook_dlq,
+        handlers::webhooks::replay_webhook_dlq_entry,
 
         handlers::nats_handler::nats_status,
         handlers::nats_handler::nats_purge_stream,

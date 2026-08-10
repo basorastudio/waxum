@@ -254,3 +254,233 @@ async fn get_session_status_shape_matches_list_entry() {
     assert_eq!(get_status_str, entry_status);
     assert_eq!(get_logged, entry_logged);
 }
+
+/// Issue #70: `GET/PUT /sessions/{id}/reconnect` used to 503 whenever the
+/// socket was down — but toggling auto-reconnect is exactly what's needed
+/// while a session is down. The endpoints now serve the stored preference
+/// from the session runtime, so they must answer 200 with no live client.
+#[tokio::test]
+async fn reconnect_config_is_serviceable_without_live_socket() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-rc"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-rc/reconnect", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("enabled").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(body.get("error_count").and_then(|v| v.as_u64()), Some(0));
+
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::PUT,
+            "/api/v1/sessions/s-rc/reconnect",
+            Some(TEST_TOKEN),
+            json!({"enabled": false}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("enabled").and_then(|v| v.as_bool()), Some(false));
+
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-rc/reconnect", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("enabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "the preference must persist on the runtime, not the live client"
+    );
+
+    let (status, _) = call(
+        &h.app,
+        req_get("/api/v1/sessions/ghost/reconnect", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issue #70, same flaw on the history-sync config pair.
+#[tokio::test]
+async fn history_sync_config_is_serviceable_without_live_socket() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-hs"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-hs/history-sync", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("skip_history_sync").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::PUT,
+            "/api/v1/sessions/s-hs/history-sync",
+            Some(TEST_TOKEN),
+            json!({"skip": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("skip_history_sync").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let (status, _) = call(
+        &h.app,
+        req_get("/api/v1/sessions/ghost/history-sync", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Issue #71: /status must expose raw socket liveness separately from
+/// `is_logged_in`, so a cached `logged_in` that outlives its socket
+/// ("limbo") is detectable. With no client attached the field is false.
+#[tokio::test]
+async fn status_reports_socket_alive_separately_from_login_state() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-limbo"}),
+        ),
+    )
+    .await;
+
+    let runtime = h.state.get_or_create_session("s-limbo", "/tmp/s-limbo");
+    runtime.set_status(waxum::models::sessions::SessionStatus::LoggedIn);
+
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-limbo/status", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("is_logged_in").and_then(|v| v.as_bool()),
+        Some(true),
+        "cached login state is still reported (status degrades to connecting)"
+    );
+    assert_eq!(
+        body.get("socket_alive").and_then(|v| v.as_bool()),
+        Some(false),
+        "no live client means the socket is down regardless of cached status"
+    );
+}
+
+/// Issue #69: re-scanning must be possible on the SAME session slot so a
+/// consumer's `session_id`-keyed state survives a re-pair. Without
+/// `reuse`, an existing ID still conflicts; with `reuse: true` the same
+/// row is returned and a fresh connect is started on it.
+#[tokio::test]
+async fn create_with_reuse_keeps_session_id_on_repair() {
+    let h = Harness::new().await;
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-repair", "name": "Original"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.pointer("/session/id").and_then(|v| v.as_str()),
+        Some("s-repair")
+    );
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-repair"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-repair", "reuse": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.pointer("/session/id").and_then(|v| v.as_str()),
+        Some("s-repair")
+    );
+    assert_eq!(
+        body.pointer("/session/name").and_then(|v| v.as_str()),
+        Some("Original"),
+        "reuse must keep the existing DB row, not overwrite it"
+    );
+
+    let (_, list) = call(&h.app, req_get("/api/v1/sessions", Some(TEST_TOKEN))).await;
+    assert_eq!(list.get("total").and_then(|v| v.as_u64()), Some(1));
+}
+
+/// Issue #69: `reuse: true` on an ID that does not exist yet just
+/// behaves like a normal create.
+#[tokio::test]
+async fn create_with_reuse_on_unknown_id_creates_normally() {
+    let h = Harness::new().await;
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-fresh", "reuse": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.pointer("/session/id").and_then(|v| v.as_str()),
+        Some("s-fresh")
+    );
+}

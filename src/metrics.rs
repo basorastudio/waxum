@@ -9,13 +9,22 @@
 //!   memory.
 //! - `waxum_sessions_live` — sessions whose upstream client agrees it's
 //!   connected AND logged in (source of truth for /status).
+//! - `waxum_session_socket_alive{session_id}` — per-session raw socket
+//!   liveness (1/0), distinct from login state: catches the "limbo"
+//!   where a cached `logged_in` outlives a dead socket.
 //! - `waxum_process_threads` — thread count from `/proc/self/status`.
 //! - `waxum_process_open_fds` — FD count from `/proc/self/fd`.
 //! - `waxum_webhook_circuits_open` — webhook target URLs currently in the
 //!   OPEN circuit-breaker state; alert when this is non-zero for long.
+//!
+//! Counters (per-session, labelled by `session_id`):
+//!
+//! - `waxum_session_socket_drops_total` — `Event::Disconnected` seen.
+//! - `waxum_session_reconnects_total` — `Event::Connected` that closed
+//!   an unplanned reconnect window (initial connects don't count).
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
-use prometheus::{Encoder, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::sync::OnceLock;
 
 use crate::state::AppState;
@@ -26,6 +35,19 @@ static SESSIONS_LIVE: OnceLock<IntGauge> = OnceLock::new();
 static PROCESS_THREADS: OnceLock<IntGauge> = OnceLock::new();
 static PROCESS_OPEN_FDS: OnceLock<IntGauge> = OnceLock::new();
 static WEBHOOK_CIRCUITS_OPEN: OnceLock<IntGauge> = OnceLock::new();
+static SESSION_SOCKET_ALIVE: OnceLock<IntGaugeVec> = OnceLock::new();
+static SESSION_DROPS: OnceLock<IntCounterVec> = OnceLock::new();
+static SESSION_RECONNECTS: OnceLock<IntCounterVec> = OnceLock::new();
+
+/// Session ids we've already exported per-session series for, so the
+/// scrape loop can prune labels for sessions that were deleted —
+/// otherwise their last gauge value would linger forever.
+static SEEN_SESSIONS: OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn seen_sessions() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    SEEN_SESSIONS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| {
@@ -55,18 +77,66 @@ fn registry() -> &'static Registry {
             "Webhook target URLs currently in open-circuit state (skipped)",
         )
         .unwrap();
+        let session_socket_alive = IntGaugeVec::new(
+            Opts::new(
+                "waxum_session_socket_alive",
+                "Per-session raw socket liveness (1 = transport connected, 0 = down)",
+            ),
+            &["session_id"],
+        )
+        .unwrap();
+        let session_drops = IntCounterVec::new(
+            Opts::new(
+                "waxum_session_socket_drops_total",
+                "Per-session count of socket drops (Event::Disconnected)",
+            ),
+            &["session_id"],
+        )
+        .unwrap();
+        let session_reconnects = IntCounterVec::new(
+            Opts::new(
+                "waxum_session_reconnects_total",
+                "Per-session count of successful reconnects closing an unplanned retry window",
+            ),
+            &["session_id"],
+        )
+        .unwrap();
         r.register(Box::new(sessions_total.clone())).unwrap();
         r.register(Box::new(sessions_live.clone())).unwrap();
         r.register(Box::new(process_threads.clone())).unwrap();
         r.register(Box::new(process_open_fds.clone())).unwrap();
         r.register(Box::new(webhook_circuits_open.clone())).unwrap();
+        r.register(Box::new(session_socket_alive.clone())).unwrap();
+        r.register(Box::new(session_drops.clone())).unwrap();
+        r.register(Box::new(session_reconnects.clone())).unwrap();
         SESSIONS_TOTAL.set(sessions_total).ok();
         SESSIONS_LIVE.set(sessions_live).ok();
         PROCESS_THREADS.set(process_threads).ok();
         PROCESS_OPEN_FDS.set(process_open_fds).ok();
         WEBHOOK_CIRCUITS_OPEN.set(webhook_circuits_open).ok();
+        SESSION_SOCKET_ALIVE.set(session_socket_alive).ok();
+        SESSION_DROPS.set(session_drops).ok();
+        SESSION_RECONNECTS.set(session_reconnects).ok();
         r
     })
+}
+
+/// Bump the per-session socket-drop counter. Called from the
+/// `Event::Disconnected` arm of the session event loop; a no-op before
+/// the first /metrics scrape initialised the registry.
+pub fn record_session_drop(session_id: &str) {
+    if let Some(c) = SESSION_DROPS.get() {
+        c.with_label_values(&[session_id]).inc();
+    }
+}
+
+/// Bump the per-session successful-reconnect counter. Called from the
+/// `Event::Connected` arm when the connect closed an unplanned retry
+/// window, so initial connects don't inflate it.
+pub fn record_session_reconnect(session_id: &str) {
+    if let Some(c) = SESSION_RECONNECTS.get() {
+        c.with_label_values(&[session_id]).inc();
+    }
 }
 
 fn read_proc_threads() -> Option<i64> {
@@ -89,14 +159,34 @@ pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse
 
     let mut total = 0i64;
     let mut live = 0i64;
-    for s in state.session_iter() {
+    let socket_alive_vec = SESSION_SOCKET_ALIVE.get().unwrap();
+    let mut current_ids = std::collections::HashSet::new();
+    for (session_id, s) in state.session_iter_with_ids() {
         total += 1;
         if s.is_alive() {
             live += 1;
         }
+        socket_alive_vec
+            .with_label_values(&[session_id.as_str()])
+            .set(if s.socket_alive() { 1 } else { 0 });
+        current_ids.insert(session_id);
     }
     SESSIONS_TOTAL.get().unwrap().set(total);
     SESSIONS_LIVE.get().unwrap().set(live);
+
+    let mut seen = seen_sessions().lock();
+    for stale in seen.difference(&current_ids).cloned().collect::<Vec<_>>() {
+        let _ = socket_alive_vec.remove_label_values(&[stale.as_str()]);
+        if let Some(c) = SESSION_DROPS.get() {
+            let _ = c.remove_label_values(&[stale.as_str()]);
+        }
+        if let Some(c) = SESSION_RECONNECTS.get() {
+            let _ = c.remove_label_values(&[stale.as_str()]);
+        }
+    }
+    *seen = current_ids;
+    drop(seen);
+
     if let Some(t) = read_proc_threads() {
         PROCESS_THREADS.get().unwrap().set(t);
     }

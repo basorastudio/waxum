@@ -463,6 +463,7 @@ pub async fn create_session_proxy(
     let create_req = CreateSessionRequest {
         id: req.id,
         name: req.name,
+        reuse: None,
         webhook: None,
         device: None,
     };

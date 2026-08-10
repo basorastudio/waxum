@@ -104,6 +104,16 @@ pub struct CreateSessionRequest {
     /// Optional friendly name for the session
     #[schema(example = "Business Account")]
     pub name: Option<String>,
+    /// When true and `id` already exists, re-scan the SAME session slot
+    /// instead of failing with 409: the existing session keeps its ID,
+    /// storage, webhooks, and DB row, and a fresh QR/pair connect is
+    /// started on it (same behavior as `POST /sessions/{id}/connect`).
+    /// This gives consumers a stable `session_id` across re-pairs
+    /// instead of fragmenting state over newly minted IDs. Ignored
+    /// webhook/name fields on reuse — update those via their own
+    /// endpoints. Has no effect when the ID does not exist yet.
+    #[serde(default)]
+    pub reuse: Option<bool>,
     /// Optional webhook configuration (session will auto-connect after creation)
     pub webhook: Option<WebhookRequest>,
     /// Optional device props override applied to the auto-spawned QR connect.
@@ -202,6 +212,11 @@ pub struct SessionStatusResponse {
     pub status: SessionStatus,
     /// Whether logged in
     pub is_logged_in: bool,
+    /// Whether the underlying socket is currently connected. Distinct
+    /// from `is_logged_in`: a cached `logged_in` status can outlive a
+    /// dead socket ("limbo"), and a live socket can precede login
+    /// during QR/pair flows.
+    pub socket_alive: bool,
     /// Phone number if available
     pub phone_number: Option<String>,
     /// Display name if available
