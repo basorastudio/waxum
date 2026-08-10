@@ -35,6 +35,22 @@ pub struct SendTextRequest {
 
     pub fake_reply: Option<FakeReplyConfig>,
 
+    /// Optional list of JIDs to @mention in the message. Each entry may
+    /// be a full JID (e.g. `559999999999@s.whatsapp.net`) or a bare
+    /// phone number. The JIDs are attached to the outgoing message's
+    /// `context_info.mentioned_jid`, and any mention whose `@user` form
+    /// is missing from `text` is appended so clients render the mention
+    /// highlight.
+    #[serde(default)]
+    #[schema(example = json!(["559999999999@s.whatsapp.net"]))]
+    pub mentions: Option<Vec<String>>,
+
+    /// When `true` and the recipient is a group chat (`@g.us`), mention
+    /// every group participant. Participant JIDs are fetched live from
+    /// the group metadata. Only meaningful for group recipients.
+    #[serde(default)]
+    pub mention_all: Option<bool>,
+
     /// Optional ISO-8601 UTC time to defer delivery until. When set in
     /// the future the message is parked in the scheduler and the API
     /// returns `status: "pending"` with a `schedule_id` instead of

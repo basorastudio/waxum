@@ -60,7 +60,36 @@ pub async fn execute_text(
     let client = get_client(state, session_id)?;
     let to_jid = resolve_recipient_jid(client.clone(), parse_jid(&request.to)?).await;
 
-    let context_info: MessageField<waproto::whatsapp::ContextInfo> =
+    let mut mentioned: Vec<String> = Vec::new();
+    if let Some(mentions) = request.mentions {
+        for entry in mentions {
+            let s = parse_jid(&entry)?.to_string();
+            if !mentioned.contains(&s) {
+                mentioned.push(s);
+            }
+        }
+    }
+    let explicit_mentions = mentioned.len();
+    if request.mention_all.unwrap_or(false) {
+        if to_jid.server != wacore_binary::jid::GROUP_SERVER {
+            return Err(ApiError::BadRequest(
+                "mention_all is only supported for group chats".to_string(),
+            ));
+        }
+        let metadata = client
+            .groups()
+            .get_metadata(&to_jid)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        for p in metadata.participants {
+            let s = p.jid.to_string();
+            if !mentioned.contains(&s) {
+                mentioned.push(s);
+            }
+        }
+    }
+
+    let mut context_info: MessageField<waproto::whatsapp::ContextInfo> =
         if let Some(ref fake) = request.fake_reply {
             crate::handlers::fake_reply::build_fake_reply_context_info(fake).into()
         } else {
@@ -73,10 +102,24 @@ pub async fn execute_text(
                 .into()
         };
 
+    let mut text = request.text;
+    if !mentioned.is_empty() {
+        for jid_str in &mentioned[..explicit_mentions] {
+            let at_form = format!("@{}", jid_str.split('@').next().unwrap_or(jid_str));
+            if !text.contains(&at_form) {
+                if !text.ends_with(' ') {
+                    text.push(' ');
+                }
+                text.push_str(&at_form);
+            }
+        }
+        context_info.get_or_insert_default().mentioned_jid = mentioned;
+    }
+
     let message = waproto::whatsapp::Message {
         extended_text_message: MessageField::some(
             waproto::whatsapp::message::ExtendedTextMessage {
-                text: Some(request.text),
+                text: Some(text),
                 context_info,
                 ..Default::default()
             },
@@ -3294,6 +3337,8 @@ pub async fn send_message(
             text: request.text,
             reply_to: None,
             fake_reply: None,
+            mentions: None,
+            mention_all: None,
             send_at: None,
         }),
     )

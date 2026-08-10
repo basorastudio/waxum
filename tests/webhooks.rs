@@ -142,3 +142,38 @@ async fn reenable_missing_webhook_returns_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn dlq_list_empty_when_nothing_failed() {
+    let h = Harness::new().await;
+    seed_session(&h, "wh-s-06").await;
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/wh-s-06/webhooks/dlq", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("count").and_then(|v| v.as_u64()), Some(0));
+    assert!(body
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn dlq_replay_missing_entry_returns_404() {
+    let h = Harness::new().await;
+    seed_session(&h, "wh-s-07").await;
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/wh-s-07/webhooks/dlq/does-not-exist/replay",
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

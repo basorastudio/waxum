@@ -313,8 +313,7 @@ pub async fn tctoken_list(
     request_body = AutoReconnectRequest,
     responses(
         (status = 200, description = "Auto-reconnect updated", body = AutoReconnectResponse),
-        (status = 404, description = "Session not found"),
-        (status = 503, description = "Not connected")
+        (status = 404, description = "Session not found")
     )
 )]
 pub async fn set_auto_reconnect(
@@ -322,13 +321,19 @@ pub async fn set_auto_reconnect(
     Path(session_id): Path<String>,
     Json(request): Json<AutoReconnectRequest>,
 ) -> Result<Json<AutoReconnectResponse>, ApiError> {
-    let client = get_client(&state, &session_id)?;
+    let runtime = config_runtime(&state, &session_id).await?;
 
-    client
-        .enable_auto_reconnect
-        .store(request.enabled, Ordering::Relaxed);
+    runtime.set_auto_reconnect_pref(request.enabled);
 
-    let error_count = client.stats().reconnect_errors;
+    let error_count = match runtime.get_client() {
+        Some(client) => {
+            client
+                .enable_auto_reconnect
+                .store(request.enabled, Ordering::Relaxed);
+            client.stats().reconnect_errors
+        }
+        None => 0,
+    };
 
     Ok(Json(AutoReconnectResponse {
         enabled: request.enabled,
@@ -346,18 +351,20 @@ pub async fn set_auto_reconnect(
     ),
     responses(
         (status = 200, description = "Auto-reconnect status", body = AutoReconnectResponse),
-        (status = 404, description = "Session not found"),
-        (status = 503, description = "Not connected")
+        (status = 404, description = "Session not found")
     )
 )]
 pub async fn get_auto_reconnect(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<AutoReconnectResponse>, ApiError> {
-    let client = get_client(&state, &session_id)?;
+    let runtime = config_runtime(&state, &session_id).await?;
 
-    let enabled = client.enable_auto_reconnect.load(Ordering::Relaxed);
-    let error_count = client.stats().reconnect_errors;
+    let enabled = runtime.auto_reconnect_enabled();
+    let error_count = runtime
+        .get_client()
+        .map(|c| c.stats().reconnect_errors)
+        .unwrap_or(0);
 
     Ok(Json(AutoReconnectResponse {
         enabled,
@@ -378,8 +385,7 @@ pub async fn get_auto_reconnect(
     request_body = HistorySyncRequest,
     responses(
         (status = 200, description = "History sync setting updated", body = HistorySyncResponse),
-        (status = 404, description = "Session not found"),
-        (status = 503, description = "Not connected")
+        (status = 404, description = "Session not found")
     )
 )]
 pub async fn set_history_sync(
@@ -387,12 +393,15 @@ pub async fn set_history_sync(
     Path(session_id): Path<String>,
     Json(request): Json<HistorySyncRequest>,
 ) -> Result<Json<HistorySyncResponse>, ApiError> {
-    let client = get_client(&state, &session_id)?;
+    let runtime = config_runtime(&state, &session_id).await?;
 
-    client.set_skip_history_sync(request.skip);
+    runtime.set_skip_history_sync_pref(request.skip);
+    if let Some(client) = runtime.get_client() {
+        client.set_skip_history_sync(request.skip);
+    }
 
     Ok(Json(HistorySyncResponse {
-        skip_history_sync: client.skip_history_sync_enabled(),
+        skip_history_sync: request.skip,
     }))
 }
 
@@ -406,18 +415,17 @@ pub async fn set_history_sync(
     ),
     responses(
         (status = 200, description = "History sync setting", body = HistorySyncResponse),
-        (status = 404, description = "Session not found"),
-        (status = 503, description = "Not connected")
+        (status = 404, description = "Session not found")
     )
 )]
 pub async fn get_history_sync(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<HistorySyncResponse>, ApiError> {
-    let client = get_client(&state, &session_id)?;
+    let runtime = config_runtime(&state, &session_id).await?;
 
     Ok(Json(HistorySyncResponse {
-        skip_history_sync: client.skip_history_sync_enabled(),
+        skip_history_sync: runtime.skip_history_sync(),
     }))
 }
 
@@ -430,4 +438,35 @@ fn get_client(
         .ok_or(ApiError::NotConnected)?;
 
     runtime.get_live_client().ok_or(ApiError::NotConnected)
+}
+
+/// Resolve the session's runtime for per-session config read/write
+/// endpoints, creating the in-memory runtime from the DB row when the
+/// session has no live client in this process. Config must be
+/// serviceable while the socket is down — disabling auto-reconnect on a
+/// dead session is exactly the case that needs it — so unlike
+/// [`get_client`] this never returns 503 for a known session.
+async fn config_runtime(
+    state: &AppState,
+    session_id: &str,
+) -> Result<std::sync::Arc<crate::state::SessionState>, ApiError> {
+    let _ = state
+        .session_manager()
+        .get_session(session_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::SessionNotFound(session_id.to_string()))?;
+
+    if let Some(runtime) = state.get_session(session_id) {
+        return Ok(runtime);
+    }
+
+    let storage_path = state
+        .session_manager()
+        .get_storage_path(session_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .unwrap_or_else(|| format!("{}/{}", state.base_storage_path(), session_id));
+
+    Ok(state.get_or_create_session(session_id, &storage_path))
 }

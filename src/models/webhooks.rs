@@ -39,6 +39,12 @@ pub enum WebhookEvent {
 
     LoggedOut,
 
+    /// Server-side account lock (WA Web 403 / REASON_LOCKED). Emitted
+    /// instead of `logged_out` when the logout reason is a lock; the
+    /// payload carries the applied cooldown so operators can surface
+    /// "account locked, cool down" instead of a generic offline state.
+    AccountLocked,
+
     PictureUpdate,
 
     UserAboutUpdate,
@@ -89,6 +95,7 @@ impl WebhookEvent {
             WebhookEvent::Connected => event == "connected",
             WebhookEvent::Disconnected => event == "disconnected",
             WebhookEvent::LoggedOut => event == "logged_out",
+            WebhookEvent::AccountLocked => event == "account_locked",
             WebhookEvent::PictureUpdate => event == "picture_update",
             WebhookEvent::UserAboutUpdate => event == "user_about_update",
             WebhookEvent::PushNameUpdate => event == "push_name_update",
@@ -123,6 +130,7 @@ impl WebhookEvent {
             WebhookEvent::Connected => "connected",
             WebhookEvent::Disconnected => "disconnected",
             WebhookEvent::LoggedOut => "logged_out",
+            WebhookEvent::AccountLocked => "account_locked",
             WebhookEvent::PictureUpdate => "picture_update",
             WebhookEvent::UserAboutUpdate => "user_about_update",
             WebhookEvent::PushNameUpdate => "push_name_update",
@@ -160,6 +168,7 @@ impl WebhookEvent {
             "connected" => Some(WebhookEvent::Connected),
             "disconnected" => Some(WebhookEvent::Disconnected),
             "logged_out" => Some(WebhookEvent::LoggedOut),
+            "account_locked" => Some(WebhookEvent::AccountLocked),
             "picture_update" => Some(WebhookEvent::PictureUpdate),
             "user_about_update" => Some(WebhookEvent::UserAboutUpdate),
             "push_name_update" => Some(WebhookEvent::PushNameUpdate),
@@ -239,6 +248,42 @@ impl From<(String, WebhookConfig)> for WebhookConfigWithId {
 pub struct WebhookListResponse {
     /// List of webhooks, each with its ID so clients can DELETE by ID.
     pub webhooks: Vec<WebhookConfigWithId>,
+    /// Total count
+    pub count: usize,
+}
+
+/// A webhook delivery that exhausted every retry attempt and was parked
+/// for manual replay. Lives in a bounded per-session in-memory ring (see
+/// `WEBHOOK_DLQ_CAPACITY`) — the queue is lost on restart.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WebhookDlqEntry {
+    /// DLQ entry ID, used by the replay endpoint.
+    pub id: String,
+    pub session_id: String,
+    pub webhook_url: String,
+    /// Event name that was being delivered (e.g. `message`).
+    pub event: String,
+    /// Raw JSON body, stored verbatim so replay re-delivers (and
+    /// re-signs) exactly what the consumer missed.
+    pub payload: String,
+    /// HMAC secret captured at failure time so replay signs identically
+    /// even if the webhook was re-registered with a different secret in
+    /// the meantime. Never leaves the process — skipped on serialize.
+    #[serde(skip)]
+    pub secret: Option<String>,
+    /// Error of the final attempt (HTTP status or transport error).
+    pub last_error: String,
+    /// How many delivery attempts were made before giving up.
+    pub attempts: usize,
+    /// Unix timestamp of the final failed attempt.
+    pub failed_at: i64,
+}
+
+/// Response with the session's dead-lettered webhook deliveries
+/// (newest first).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookDlqListResponse {
+    pub entries: Vec<WebhookDlqEntry>,
     /// Total count
     pub count: usize,
 }

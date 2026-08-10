@@ -26,8 +26,9 @@ use crate::state::AppState;
     request_body = CreateSessionRequest,
     responses(
         (status = 201, description = "Session created and connecting", body = CreateSessionResponse),
+        (status = 200, description = "Existing session reused (re-scan started on the same slot)", body = CreateSessionResponse),
         (status = 400, description = "Invalid request"),
-        (status = 409, description = "Session ID already exists")
+        (status = 409, description = "Session ID already exists (set `reuse: true` to re-scan the same slot)")
     )
 )]
 pub async fn create_session(
@@ -36,14 +37,20 @@ pub async fn create_session(
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let session_id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    if state
+    if let Some(existing) = state
         .session_manager()
         .get_session(&session_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
-        .is_some()
     {
-        return Err(ApiError::AlreadyConnected);
+        if !request.reuse.unwrap_or(false) {
+            return Err(ApiError::AlreadyConnected);
+        }
+        let connect_req = request
+            .device
+            .map(|d| Json(ConnectRequest { device: Some(d) }));
+        let _ = connect_session(State(state), Path(session_id), connect_req).await?;
+        return Ok(Json(CreateSessionResponse { session: existing }));
     }
 
     let storage_path = format!("{}/{}", state.base_storage_path(), session_id);
@@ -261,37 +268,41 @@ pub async fn get_session_status(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
-    let (status, is_logged_in, pair) = if let Some(runtime) = state.get_session(&session_id) {
-        let ps = runtime.get_pair_state();
-        let pair = crate::models::sessions::PairStatus {
-            last_qr_at: ps.last_qr_at,
-            last_pair_code_at: ps.last_pair_code_at,
-            pair_code_expires_at: ps.pair_code_expires_at,
-            last_error: ps.last_error,
-            attempts: ps.attempts,
-        };
-        if runtime.is_alive() {
-            (SessionStatus::LoggedIn, true, pair)
-        } else {
-            let s = runtime.get_status();
-            let (status, is_logged_in) = if s == SessionStatus::LoggedIn {
-                (SessionStatus::Connecting, true)
-            } else {
-                (s, false)
+    let (status, is_logged_in, socket_alive, pair) =
+        if let Some(runtime) = state.get_session(&session_id) {
+            let ps = runtime.get_pair_state();
+            let pair = crate::models::sessions::PairStatus {
+                last_qr_at: ps.last_qr_at,
+                last_pair_code_at: ps.last_pair_code_at,
+                pair_code_expires_at: ps.pair_code_expires_at,
+                last_error: ps.last_error,
+                attempts: ps.attempts,
             };
-            (status, is_logged_in, pair)
-        }
-    } else {
-        (
-            session.status,
-            session.is_logged_in,
-            crate::models::sessions::PairStatus::default(),
-        )
-    };
+            let socket_alive = runtime.socket_alive();
+            if runtime.is_alive() {
+                (SessionStatus::LoggedIn, true, socket_alive, pair)
+            } else {
+                let s = runtime.get_status();
+                let (status, is_logged_in) = if s == SessionStatus::LoggedIn {
+                    (SessionStatus::Connecting, true)
+                } else {
+                    (s, false)
+                };
+                (status, is_logged_in, socket_alive, pair)
+            }
+        } else {
+            (
+                session.status,
+                session.is_logged_in,
+                false,
+                crate::models::sessions::PairStatus::default(),
+            )
+        };
 
     Ok(Json(SessionStatusResponse {
         status,
         is_logged_in,
+        socket_alive,
         phone_number: session.phone_number,
         push_name: session.push_name,
         pair,
@@ -395,6 +406,7 @@ pub async fn connect_session(
         runtime.set_client(None);
         runtime.set_status(SessionStatus::Disconnected);
         runtime.clear_reconnecting();
+        runtime.clear_lock_cooldown();
     }
 
     let storage_path = state
@@ -1003,7 +1015,8 @@ pub async fn reconnect_all_on_startup(state: AppState) {
 /// crate to eventually recover on its own. Also broadcasts a synthetic
 /// `disconnected` webhook/event as a safety net -- see the module docs on
 /// `Event::Disconnected` for why the crate doesn't always dispatch one for
-/// a socket that dies silently.
+/// a socket that dies silently. Sessions paused by an account-lock
+/// cooldown (`ACCOUNT_LOCK_BACKOFF_SECS`) are skipped outright.
 pub async fn run_reconnect_watchdog(state: AppState) {
     let poll_ms: u64 = std::env::var("RECONNECT_WATCHDOG_POLL_MS")
         .ok()
@@ -1031,6 +1044,14 @@ pub async fn run_reconnect_watchdog(state: AppState) {
         ticker.tick().await;
         for (session_id, runtime) in state.session_iter_with_ids() {
             if runtime.get_status() != SessionStatus::Connecting {
+                continue;
+            }
+            if let Some(remaining) = runtime.lock_cooldown_remaining() {
+                tracing::debug!(
+                    session_id = %session_id,
+                    cooldown_remaining_secs = remaining,
+                    "reconnect watchdog: skipping session in account-lock cooldown"
+                );
                 continue;
             }
             let Some(client) = runtime.get_client() else {
@@ -1152,8 +1173,11 @@ async fn connect_client(
 
     if let Some(runtime) = state.get_session(session_id) {
         let c = bot.client();
-        c.enable_auto_reconnect
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.enable_auto_reconnect.store(
+            runtime.auto_reconnect_enabled(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        c.set_skip_history_sync(runtime.skip_history_sync());
         runtime.set_client(Some(c));
         runtime.set_status(SessionStatus::WaitingForQr);
     }
@@ -1247,8 +1271,11 @@ async fn connect_client_with_pair_code(
 
     if let Some(runtime) = state.get_session(session_id) {
         let c = bot.client();
-        c.enable_auto_reconnect
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.enable_auto_reconnect.store(
+            runtime.auto_reconnect_enabled(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        c.set_skip_history_sync(runtime.skip_history_sync());
         runtime.set_client(Some(c));
     }
 
@@ -1309,6 +1336,9 @@ async fn handle_event(
         }
         Event::Connected(_) => {
             tracing::info!("Session {}: Connected", session_id);
+            if runtime.reconnecting_for_secs().is_some() {
+                crate::metrics::record_session_reconnect(session_id);
+            }
             runtime.set_status(SessionStatus::LoggedIn);
             runtime.set_qr_codes(vec![]);
             runtime.set_pair_code(None);
@@ -1354,13 +1384,23 @@ async fn handle_event(
             }
             runtime.set_status(SessionStatus::Connecting);
             runtime.mark_reconnecting_now();
+            crate::metrics::record_session_drop(session_id);
             let _ = state
                 .session_manager()
                 .update_session_status(session_id, SessionStatus::Connecting, false)
                 .await;
         }
         Event::LoggedOut(logged_out) => {
+            let is_lock = matches!(
+                logged_out.reason,
+                wacore::types::events::ConnectFailureReason::AccountLocked
+            );
             if let Some(client) = runtime.get_client() {
+                if is_lock {
+                    client
+                        .enable_auto_reconnect
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
                 client.disconnect().await;
             }
             runtime.set_status(SessionStatus::Disconnected);
@@ -1370,6 +1410,37 @@ async fn handle_event(
                 .session_manager()
                 .update_session_status(session_id, SessionStatus::Disconnected, false)
                 .await;
+
+            if is_lock {
+                let (cooldown_secs, cooldown_until) =
+                    runtime.record_lock_cooldown(&state.account_lock_backoff().schedule);
+                tracing::warn!(
+                    session_id = %session_id,
+                    reason = ?logged_out.reason,
+                    cooldown_secs,
+                    "account_locked, cooling down — auto-reconnect paused until manual reconnect"
+                );
+                let payload = serde_json::json!({
+                    "session_id": session_id,
+                    "event": "account_locked",
+                    "timestamp": chrono::Utc::now().timestamp(),
+                    "data": {
+                        "reason": format!("{:?}", logged_out.reason),
+                        "cooldown_secs": cooldown_secs,
+                        "cooldown_until": cooldown_until,
+                    },
+                });
+                if let Ok(payload_str) = serde_json::to_string(&payload) {
+                    state
+                        .broadcast_to_webhooks(session_id, "account_locked", &payload_str)
+                        .await;
+                    state
+                        .publish_to_nats(session_id, "account_locked", &payload_str)
+                        .await;
+                    runtime.broadcast_event(payload_str);
+                }
+                return;
+            }
 
             let should_purge = runtime.record_logout_and_should_purge();
             if !should_purge {
@@ -1417,6 +1488,17 @@ async fn handle_event(
 
     if let Event::Messages(batch) = event.as_ref() {
         let timestamp = chrono::Utc::now().timestamp();
+        let offline = matches!(
+            batch.origin,
+            wacore::types::events::BatchOrigin::OfflineDrain
+        );
+        if offline {
+            tracing::info!(
+                session_id = %session_id,
+                count = batch.messages.len(),
+                "offline sync: replaying messages received while disconnected"
+            );
+        }
         for im in batch.messages.iter() {
             crate::handlers::search::record_incoming(state, session_id, &im.message, &im.info)
                 .await;
@@ -1426,6 +1508,7 @@ async fn handle_event(
                 "session_id": session_id,
                 "event": "message",
                 "timestamp": timestamp,
+                "offline": offline,
                 "data": data,
             });
             if let Ok(payload) = serde_json::to_string(&payload_value) {

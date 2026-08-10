@@ -16,6 +16,7 @@
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -24,8 +25,107 @@ use whatsapp_rust::Client;
 use crate::db::session::DbPool;
 use crate::db::SessionManager;
 use crate::models::sessions::SessionStatus;
-use crate::models::webhooks::WebhookConfig;
+use crate::models::webhooks::{WebhookConfig, WebhookDlqEntry};
 use crate::nats::NatsManager;
+
+/// Value of the `X-Webhook-Signature-Version` header sent with every
+/// webhook delivery. `v2` = HMAC-SHA256 over `"{timestamp}.{body}"`
+/// (timestamp-prefixed, hex digest with a `sha256=` prefix); the legacy
+/// pre-0.9.8 scheme signed the raw body alone and carried no version
+/// header at all, so consumers can treat a missing header as `v1`.
+pub const WEBHOOK_SIGNATURE_VERSION: &str = "v2";
+
+/// Runtime retry/dead-letter policy for webhook delivery, read once at
+/// startup from the environment:
+///
+/// - `WEBHOOK_RETRY_MAX_ATTEMPTS` (default 3) — total delivery attempts
+///   per event before the payload lands in the DLQ. Backoff between
+///   attempts: immediate, +5 s, +30 s, then doubling (60 s, 120 s, ...)
+///   capped at 5 min.
+/// - `WEBHOOK_RETRY_ON_4XX` (default true) — also retry 4xx responses.
+///   A 401/403 window is usually a consumer-side auth misconfig that
+///   gets fixed; dropping those events on the first attempt loses
+///   messages for good. Set to `false` to restore the old "4xx is
+///   permanent" behavior (408/429 are retried either way).
+/// - `WEBHOOK_DLQ_CAPACITY` (default 100) — per-session in-memory DLQ
+///   ring size; oldest entries are evicted past the cap.
+#[derive(Clone, Debug)]
+pub struct WebhookRetryConfig {
+    pub max_attempts: usize,
+    pub retry_on_4xx: bool,
+    pub dlq_capacity: usize,
+}
+
+impl WebhookRetryConfig {
+    fn from_env() -> Self {
+        let max_attempts = std::env::var("WEBHOOK_RETRY_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3);
+        let retry_on_4xx = std::env::var("WEBHOOK_RETRY_ON_4XX")
+            .map(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
+        let dlq_capacity = std::env::var("WEBHOOK_DLQ_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(100);
+        Self {
+            max_attempts,
+            retry_on_4xx,
+            dlq_capacity,
+        }
+    }
+}
+
+/// Escalating cooldown applied when WhatsApp locks an account
+/// (`ConnectFailureReason::AccountLocked`, WA Web 403 / REASON_LOCKED).
+/// Read once at startup from `ACCOUNT_LOCK_BACKOFF_SECS` — a
+/// comma-separated list of cooldown seconds, default `300,900,3600`
+/// (5 min → 15 min → 60 min). The first lock applies step 0, the next
+/// lock inside the same process lifetime applies step 1, and so on; the
+/// last step repeats once the list is exhausted. A locked account only
+/// recovers when reconnect attempts stop, so a manual
+/// `POST /sessions/:id/connect` is the intended way out and clears the
+/// cooldown.
+#[derive(Clone, Debug)]
+pub struct AccountLockBackoffConfig {
+    pub schedule: Vec<i64>,
+}
+
+impl AccountLockBackoffConfig {
+    fn from_env() -> Self {
+        let schedule = std::env::var("ACCOUNT_LOCK_BACKOFF_SECS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|s| s.trim().parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![300, 900, 3600]);
+        Self { schedule }
+    }
+}
+
+/// Backoff before attempt `n` (0-based): the first try is immediate,
+/// then 5 s, 30 s, and doubling from 60 s afterwards, capped at 5 min.
+fn webhook_retry_delay(attempt: usize) -> Duration {
+    match attempt {
+        0 => Duration::ZERO,
+        1 => Duration::from_secs(5),
+        2 => Duration::from_secs(30),
+        n => Duration::from_secs(60u64.saturating_mul(2u64.saturating_pow((n - 3) as u32)))
+            .min(Duration::from_secs(300)),
+    }
+}
 
 /// Shared reqwest client for webhook delivery. Per-call `Client::new()` skips
 /// the connection pool and uses the OS-level TCP timeout (~75 s), so a
@@ -89,6 +189,31 @@ pub struct SessionState {
     /// long and needs a forced full rebuild rather than waiting on
     /// whatsapp-rust's own backoff indefinitely.
     pub reconnecting_since: RwLock<Option<i64>>,
+
+    /// Unix timestamp until which auto-reconnect is paused because the
+    /// server locked the account (`AccountLocked`). `None` = not locked.
+    /// In-memory only: after a restart the DB status is already
+    /// `Disconnected`, so the startup reconnect skips the session anyway
+    /// and the next lock event simply re-arms the cooldown. Cleared by a
+    /// manual `POST /sessions/:id/connect`.
+    pub lock_cooldown_until: RwLock<Option<i64>>,
+
+    /// Consecutive `AccountLocked` events seen in this process lifetime.
+    /// Indexes into [`AccountLockBackoffConfig::schedule`] so repeat
+    /// locks cool down for progressively longer.
+    pub lock_strikes: RwLock<u32>,
+
+    /// Operator's auto-reconnect preference, stored gateway-side so
+    /// `GET/PUT /sessions/:id/reconnect` work while the socket is down.
+    /// Applied to each freshly built client in `connect_client`; a live
+    /// client is also updated in place by the PUT handler. Defaults to
+    /// `true`, matching the historical hardcoded behavior.
+    pub auto_reconnect_pref: AtomicBool,
+
+    /// Same idea for `GET/PUT /sessions/:id/history-sync`: the
+    /// skip-history-sync flag, stored gateway-side and applied to every
+    /// newly built client.
+    pub skip_history_sync_pref: AtomicBool,
 }
 
 /// Snapshot of the latest pair attempt for a session. Lives entirely in
@@ -115,6 +240,61 @@ impl SessionState {
             logout_history: RwLock::new(Vec::new()),
             pair_state: RwLock::new(PairState::default()),
             reconnecting_since: RwLock::new(None),
+            lock_cooldown_until: RwLock::new(None),
+            lock_strikes: RwLock::new(0),
+            auto_reconnect_pref: AtomicBool::new(true),
+            skip_history_sync_pref: AtomicBool::new(false),
+        }
+    }
+
+    pub fn auto_reconnect_enabled(&self) -> bool {
+        self.auto_reconnect_pref.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_reconnect_pref(&self, enabled: bool) {
+        self.auto_reconnect_pref.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn skip_history_sync(&self) -> bool {
+        self.skip_history_sync_pref.load(Ordering::Relaxed)
+    }
+
+    pub fn set_skip_history_sync_pref(&self, skip: bool) {
+        self.skip_history_sync_pref.store(skip, Ordering::Relaxed);
+    }
+
+    /// Record an `AccountLocked` event and return the cooldown just
+    /// applied as `(cooldown_secs, cooldown_until)`. Each strike walks
+    /// one step further down `schedule`, clamped at the last entry.
+    pub fn record_lock_cooldown(&self, schedule: &[i64]) -> (i64, i64) {
+        let mut strikes = self.lock_strikes.write();
+        *strikes = strikes.saturating_add(1);
+        let idx = (*strikes as usize)
+            .saturating_sub(1)
+            .min(schedule.len() - 1);
+        let secs = schedule[idx];
+        let until = chrono::Utc::now().timestamp() + secs;
+        *self.lock_cooldown_until.write() = Some(until);
+        (secs, until)
+    }
+
+    /// Manual intervention (`POST /sessions/:id/connect`): lift the
+    /// lock cooldown and reset the escalation ladder.
+    pub fn clear_lock_cooldown(&self) {
+        *self.lock_cooldown_until.write() = None;
+        *self.lock_strikes.write() = 0;
+    }
+
+    /// Seconds of lock cooldown remaining, or `None` when the session
+    /// is not currently paused. The watchdog and other self-heal paths
+    /// must skip the session while this is `Some`.
+    pub fn lock_cooldown_remaining(&self) -> Option<i64> {
+        let until = (*self.lock_cooldown_until.read())?;
+        let remaining = until - chrono::Utc::now().timestamp();
+        if remaining > 0 {
+            Some(remaining)
+        } else {
+            None
         }
     }
 
@@ -185,6 +365,18 @@ impl SessionState {
     pub fn is_alive(&self) -> bool {
         match self.client.read().as_ref() {
             Some(c) => c.is_connected() && c.is_logged_in(),
+            None => false,
+        }
+    }
+
+    /// Raw socket liveness, deliberately separate from [`Self::is_alive`]:
+    /// `true` as soon as the transport is connected, even before login
+    /// completes (QR/pair flows) — and `false` during the "limbo" where a
+    /// cached `LoggedIn` status outlives a dead socket. Surfaced as
+    /// `socket_alive` on /status, /readyz, and /metrics.
+    pub fn socket_alive(&self) -> bool {
+        match self.client.read().as_ref() {
+            Some(c) => c.is_connected(),
             None => false,
         }
     }
@@ -272,6 +464,20 @@ struct AppStateInner {
     pub recordings: crate::storage::RecordingStore,
 
     pub webhook_circuits: DashMap<String, CircuitState>,
+
+    /// Retry/dead-letter policy for webhook delivery (env-configurable,
+    /// see [`WebhookRetryConfig`]).
+    pub webhook_retry: WebhookRetryConfig,
+
+    /// Escalating cooldown schedule for server-side account locks
+    /// (env-configurable, see [`AccountLockBackoffConfig`]).
+    pub account_lock_backoff: AccountLockBackoffConfig,
+
+    /// Per-session dead-letter queue for webhook deliveries that
+    /// exhausted every retry attempt. Bounded ring per session
+    /// (`webhook_retry.dlq_capacity`), in-memory only — lost on restart
+    /// (the DB `webhook_dlq` table keeps a durable copy of each failure).
+    pub webhook_dlq: DashMap<String, std::collections::VecDeque<WebhookDlqEntry>>,
 
     pub incoming_calls: DashMap<String, wacore::types::call::IncomingCall>,
 
@@ -364,6 +570,9 @@ impl AppState {
                 nats,
                 recordings,
                 webhook_circuits: DashMap::new(),
+                webhook_retry: WebhookRetryConfig::from_env(),
+                account_lock_backoff: AccountLockBackoffConfig::from_env(),
+                webhook_dlq: DashMap::new(),
                 incoming_calls: DashMap::new(),
                 active_calls: DashMap::new(),
                 call_audio_channels: DashMap::new(),
@@ -644,6 +853,41 @@ impl AppState {
 
     pub fn purge_webhooks_for_session(&self, session_id: &str) {
         self.inner.webhooks.remove(session_id);
+        self.inner.webhook_dlq.remove(session_id);
+    }
+
+    /// Push a permanently-failed delivery onto the session's in-memory
+    /// DLQ ring, evicting the oldest entries past the configured
+    /// capacity.
+    pub fn webhook_dlq_push(&self, entry: WebhookDlqEntry) {
+        let capacity = self.inner.webhook_retry.dlq_capacity;
+        let mut ring = self
+            .inner
+            .webhook_dlq
+            .entry(entry.session_id.clone())
+            .or_default();
+        while ring.len() >= capacity {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+
+    /// List the session's DLQ entries, newest first.
+    pub fn webhook_dlq_list(&self, session_id: &str) -> Vec<WebhookDlqEntry> {
+        self.inner
+            .webhook_dlq
+            .get(session_id)
+            .map(|r| r.value().iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove and return one DLQ entry. Used by the replay endpoint —
+    /// the re-delivery goes through the same delivery path and re-enters
+    /// the queue on its own if it fails again.
+    pub fn webhook_dlq_take(&self, session_id: &str, entry_id: &str) -> Option<WebhookDlqEntry> {
+        let mut ring = self.inner.webhook_dlq.get_mut(session_id)?;
+        let pos = ring.iter().position(|e| e.id == entry_id)?;
+        ring.remove(pos)
     }
 
     /// Bulk close-and-reset every open circuit. Used by
@@ -690,6 +934,10 @@ impl AppState {
 
     pub fn session_manager(&self) -> &SessionManager {
         &self.inner.session_manager
+    }
+
+    pub fn account_lock_backoff(&self) -> &AccountLockBackoffConfig {
+        &self.inner.account_lock_backoff
     }
 
     pub fn base_storage_path(&self) -> &str {
@@ -774,15 +1022,19 @@ impl AppState {
     /// replay forever with a still-valid signature. Binding the signature
     /// to a timestamp that ships alongside it lets a receiver reject
     /// anything outside a short window -- see webhooks.md for the
-    /// verification recipe receivers are expected to implement.
+    /// verification recipe receivers are expected to implement. Every
+    /// delivery also carries `X-Webhook-Signature-Version: v2`
+    /// ([`WEBHOOK_SIGNATURE_VERSION`]) so consumers can detect the
+    /// timestamp-prefixed scheme introduced in v0.9.8.
+    ///
+    /// Each webhook's delivery runs in its own spawned task
+    /// ([`Self::deliver_webhook`]) with configurable retries and a
+    /// dead-letter queue, so a slow or dead target never blocks the
+    /// event pipeline.
     pub async fn broadcast_to_webhooks(&self, session_id: &str, event: &str, payload: &str) {
         self.push_event(session_id, event, payload);
 
         let webhooks = self.get_webhooks(session_id);
-        let client = webhook_client();
-        let pool = self.session_manager().pool().clone();
-        let session_id_owned = session_id.to_string();
-        let event_owned = event.to_string();
 
         for (_, config) in webhooks {
             if !config.enabled {
@@ -797,124 +1049,179 @@ impl AppState {
                 continue;
             }
 
-            let url = config.url.clone();
-            let payload = payload.to_string();
-            let secret = config.secret.clone();
-            let client = client.clone();
-            let pool = pool.clone();
-            let session_id_owned = session_id_owned.clone();
-            let event_owned = event_owned.clone();
             let state_for_task = self.clone();
+            let session_id_owned = session_id.to_string();
+            let event_owned = event.to_string();
+            let payload_owned = payload.to_string();
 
             tokio::spawn(async move {
-                let backoff_ms = [0u64, 1000, 3000, 7000];
-                let mut last_err: Option<String> = None;
-                for (i, delay) in backoff_ms.iter().enumerate() {
-                    if *delay > 0 {
-                        tokio::time::sleep(Duration::from_millis(*delay)).await;
-                    }
-
-                    let timestamp = chrono::Utc::now().timestamp();
-                    let mut req = client
-                        .post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("X-Webhook-Timestamp", timestamp.to_string())
-                        .body(payload.clone());
-
-                    if let Some(secret) = &secret {
-                        use hmac::{Hmac, Mac};
-                        use sha2::Sha256;
-
-                        type HmacSha256 = Hmac<Sha256>;
-                        if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
-                            mac.update(format!("{timestamp}.{payload}").as_bytes());
-                            let signature = hex::encode(mac.finalize().into_bytes());
-                            req =
-                                req.header("X-Webhook-Signature", format!("sha256={}", signature));
-                        }
-                    }
-
-                    match req.send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            if status.is_success() {
-                                state_for_task.webhook_record_success(&url);
-                                return;
-                            }
-                            if status.is_client_error()
-                                && status.as_u16() != 408
-                                && status.as_u16() != 429
-                            {
-                                tracing::warn!(
-                                    "Webhook {} rejected with {} — not retrying",
-                                    url,
-                                    status
-                                );
-                                return;
-                            }
-                            last_err = Some(format!("HTTP {}", status));
-                        }
-                        Err(e) => {
-                            last_err = Some(e.to_string());
-                        }
-                    }
-                    let _ = i;
-                }
-                if let Some(err) = last_err {
-                    let action = state_for_task.webhook_record_failure(&url);
-                    match action {
-                        WebhookFailureAction::HardDisable => {
-                            tracing::warn!(
-                                "Webhook {} auto-DISABLED after 100 consecutive failures — DB row switched to enabled=false",
-                                url
-                            );
-                            let reason = format!("100 consecutive failures ({err})");
-                            match state_for_task
-                                .session_manager()
-                                .disable_webhook_by_url(&url, &reason)
-                                .await
-                            {
-                                Ok(n) => tracing::info!(
-                                    "webhook auto-disable: {} row(s) marked enabled=false for {}",
-                                    n,
-                                    url
-                                ),
-                                Err(err) => tracing::warn!(
-                                    "webhook auto-disable persist failed for {}: {}",
-                                    url,
-                                    err
-                                ),
-                            }
-                            state_for_task.purge_webhook_by_url(&url);
-                        }
-                        WebhookFailureAction::Open => {
-                            tracing::warn!(
-                                "Webhook {} circuit OPEN after 25 consecutive failures — skipping dispatch for 5 min",
-                                url
-                            );
-                        }
-                        WebhookFailureAction::Noop => {
-                            tracing::warn!(
-                                "Failed to send webhook to {} after {} attempts: {}",
-                                url,
-                                backoff_ms.len(),
-                                err
-                            );
-                        }
-                    }
-                    crate::db::webhook_dlq::record_failure(
-                        &pool,
+                state_for_task
+                    .deliver_webhook(
                         &session_id_owned,
-                        &url,
                         &event_owned,
-                        &payload,
-                        &err,
-                        backoff_ms.len() as i32,
+                        &config.url,
+                        config.secret,
+                        &payload_owned,
                     )
                     .await;
-                }
             });
         }
+    }
+
+    /// One full delivery run of `payload` against `url`: up to
+    /// `WEBHOOK_RETRY_MAX_ATTEMPTS` tries with exponential backoff
+    /// (immediate, +5 s, +30 s, ...), HMAC-signing each attempt when
+    /// `secret` is set. Retries cover 5xx and transport errors, plus
+    /// 4xx when `WEBHOOK_RETRY_ON_4XX` is on (the default — a 401/403
+    /// window is usually a fixable consumer misconfig, and dropping
+    /// those events loses messages).
+    ///
+    /// When every attempt fails the failure is recorded against the
+    /// per-URL circuit breaker and the payload is dead-lettered — onto
+    /// the session's bounded in-memory DLQ (replayable via
+    /// `POST .../webhooks/dlq/{entry_id}/replay`) and into the DB
+    /// `webhook_dlq` table. Returns `true` when a delivery succeeded.
+    ///
+    /// Used both by [`Self::broadcast_to_webhooks`] (fresh events) and
+    /// by the DLQ replay endpoint (stored payloads), so both paths
+    /// share the exact same signing and retry behavior.
+    pub async fn deliver_webhook(
+        &self,
+        session_id: &str,
+        event: &str,
+        url: &str,
+        secret: Option<String>,
+        payload: &str,
+    ) -> bool {
+        let retry_cfg = self.inner.webhook_retry.clone();
+        let max_attempts = retry_cfg.max_attempts.max(1);
+        let client = webhook_client();
+        let pool = self.session_manager().pool().clone();
+        let mut last_err: Option<String> = None;
+
+        for attempt in 0..max_attempts {
+            let delay = webhook_retry_delay(attempt);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+
+            let timestamp = chrono::Utc::now().timestamp();
+            let mut req = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .header("X-Webhook-Timestamp", timestamp.to_string())
+                .header("X-Webhook-Signature-Version", WEBHOOK_SIGNATURE_VERSION)
+                .body(payload.to_string());
+
+            if let Some(secret) = &secret {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+
+                type HmacSha256 = Hmac<Sha256>;
+                if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
+                    mac.update(format!("{timestamp}.{payload}").as_bytes());
+                    let signature = hex::encode(mac.finalize().into_bytes());
+                    req = req.header("X-Webhook-Signature", format!("sha256={}", signature));
+                }
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        self.webhook_record_success(url);
+                        return true;
+                    }
+                    if !retry_cfg.retry_on_4xx
+                        && status.is_client_error()
+                        && status.as_u16() != 408
+                        && status.as_u16() != 429
+                    {
+                        tracing::warn!(
+                            "Webhook {} rejected with {} — not retrying (WEBHOOK_RETRY_ON_4XX=false), dead-lettering",
+                            url,
+                            status
+                        );
+                        last_err = Some(format!("HTTP {}", status));
+                        break;
+                    }
+                    last_err = Some(format!("HTTP {}", status));
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        let err = match last_err {
+            Some(err) => err,
+            None => return false,
+        };
+
+        let action = self.webhook_record_failure(url);
+        match action {
+            WebhookFailureAction::HardDisable => {
+                tracing::warn!(
+                    "Webhook {} auto-DISABLED after 100 consecutive failures — DB row switched to enabled=false",
+                    url
+                );
+                let reason = format!("100 consecutive failures ({err})");
+                match self
+                    .session_manager()
+                    .disable_webhook_by_url(url, &reason)
+                    .await
+                {
+                    Ok(n) => tracing::info!(
+                        "webhook auto-disable: {} row(s) marked enabled=false for {}",
+                        n,
+                        url
+                    ),
+                    Err(err) => {
+                        tracing::warn!("webhook auto-disable persist failed for {}: {}", url, err)
+                    }
+                }
+                self.purge_webhook_by_url(url);
+            }
+            WebhookFailureAction::Open => {
+                tracing::warn!(
+                    "Webhook {} circuit OPEN after 25 consecutive failures — skipping dispatch for 5 min",
+                    url
+                );
+            }
+            WebhookFailureAction::Noop => {
+                tracing::warn!(
+                    "Failed to send webhook to {} after {} attempts: {}",
+                    url,
+                    max_attempts,
+                    err
+                );
+            }
+        }
+
+        self.webhook_dlq_push(WebhookDlqEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            webhook_url: url.to_string(),
+            event: event.to_string(),
+            payload: payload.to_string(),
+            secret,
+            last_error: err.clone(),
+            attempts: max_attempts,
+            failed_at: chrono::Utc::now().timestamp(),
+        });
+
+        crate::db::webhook_dlq::record_failure(
+            &pool,
+            session_id,
+            url,
+            event,
+            payload,
+            &err,
+            max_attempts as i32,
+        )
+        .await;
+
+        false
     }
 }
 

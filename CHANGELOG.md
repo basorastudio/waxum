@@ -2,6 +2,50 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [Unreleased]
+
+### BREAKING — webhook signature scheme is now versioned (`v2`)
+
+Every webhook delivery now carries an `X-Webhook-Signature-Version: v2`
+header so consumers can detect which HMAC scheme produced
+`X-Webhook-Signature`. `v2` is the timestamp-prefixed scheme introduced
+in v0.9.8 — HMAC-SHA256 over `"{timestamp}.{body}"` (the
+`X-Webhook-Timestamp` value and the raw request body joined with a
+literal `.`), hex-encoded digest with a `sha256=` prefix. The pre-0.9.8
+scheme (HMAC over the raw body alone) carried no version header;
+consumers that support both should treat a missing header as `v1`. No
+change to the `v2` signing algorithm itself — deliveries are signed
+exactly as before, the header only makes the scheme explicit.
+
+### Added — webhook delivery retries with backoff + dead-letter queue
+
+Failed webhook deliveries (non-2xx or transport error) are no longer
+dropped after the first round of attempts:
+
+- **Configurable retry policy.** `WEBHOOK_RETRY_MAX_ATTEMPTS`
+  (default `3`) sets total attempts per event with exponential backoff
+  (immediate, +5 s, +30 s, then doubling capped at 5 min).
+  `WEBHOOK_RETRY_ON_4XX` (default `true`) also retries 4xx responses —
+  a 401/403 window is usually a fixable consumer-side misconfig, and
+  dropping those events loses messages; set it to `false` to restore
+  the old "4xx is permanent" behavior (408/429 are retried either way).
+  Retries run in a spawned task and still respect the per-URL circuit
+  breaker.
+- **Dead-letter queue.** Deliveries that exhaust every attempt are
+  parked in a bounded per-session in-memory DLQ (`WEBHOOK_DLQ_CAPACITY`,
+  default `100`, oldest evicted past the cap) in addition to the
+  existing DB `webhook_dlq` table. Each entry keeps everything needed
+  to replay: session id, webhook URL, event name, verbatim payload,
+  captured HMAC secret, failure reason, attempt count and timestamp.
+  Note: the in-memory queue is **lost on restart** — the DB table is
+  the durable record.
+- **New endpoints** to inspect and replay the DLQ:
+  - `GET /api/v1/sessions/{session_id}/webhooks/dlq` — list entries,
+    newest first.
+  - `POST /api/v1/sessions/{session_id}/webhooks/dlq/{entry_id}/replay` —
+    re-deliver the stored payload through the same signing/retry path;
+    a failed replay lands back in the DLQ as a new entry.
+
 ## [0.11.6] - 2026-08-07
 
 ### Changed

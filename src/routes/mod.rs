@@ -548,6 +548,14 @@ fn session_routes() -> Router<AppState> {
             post(handlers::webhooks::register_webhook),
         )
         .route(
+            "/{session_id}/webhooks/dlq",
+            get(handlers::webhooks::list_webhook_dlq),
+        )
+        .route(
+            "/{session_id}/webhooks/dlq/{entry_id}/replay",
+            post(handlers::webhooks::replay_webhook_dlq_entry),
+        )
+        .route(
             "/{session_id}/webhooks/{webhook_id}",
             delete(handlers::webhooks::unregister_webhook),
         )
@@ -641,9 +649,30 @@ async fn readyz(
         .await
         .map(|s| s.len())
         .unwrap_or(0);
+    let session_states: Vec<serde_json::Value> = state
+        .session_iter_with_ids()
+        .iter()
+        .map(|(id, runtime)| {
+            json!({
+                "id": id,
+                "status": runtime.get_status().as_str(),
+                "socket_alive": runtime.socket_alive(),
+            })
+        })
+        .collect();
+    let sessions_live = session_states
+        .iter()
+        .filter(|s| {
+            s.get("socket_alive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
     let body = json!({
         "db": if db_ok { "ok" } else { "fail" },
         "sessions_known": sessions,
+        "sessions_live": sessions_live,
+        "sessions": session_states,
     });
     let status = if db_ok {
         StatusCode::OK
