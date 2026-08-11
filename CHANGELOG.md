@@ -2,7 +2,7 @@
 
 All notable changes to **waxum** will be documented in this file.
 
-## [Unreleased]
+## [0.12.0] - 2026-08-10
 
 ### BREAKING — webhook signature scheme is now versioned (`v2`)
 
