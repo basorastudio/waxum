@@ -26,13 +26,14 @@ use axum::{
     Json,
 };
 use wacore_binary::jid::Jid;
+use whatsapp_rust_chat_store::{ArrivalCursor, MessageKind};
 
 use crate::db::messages::{self, MediaPointer, MessageRow, NewMessage};
 use crate::error::ApiError;
 use crate::models::media::MediaType;
 use crate::models::search::{
     ChatMessagesQuery, MessageFleetSearchQuery, MessageHit, MessageMedia, MessageSearchQuery,
-    MessageSearchResponse,
+    MessageSearchResponse, SessionMessagesQuery, SessionMessagesResponse,
 };
 use crate::state::AppState;
 
@@ -226,6 +227,129 @@ pub async fn list_chat_messages(
     Ok(Json(rows_to_response(rows)))
 }
 
+/// Map the upstream chat store's [`MessageKind`] to the `msg_type` slugs
+/// the rest of the gateway uses (`text`, `image`, `ptt`, ...).
+fn message_kind_slug(kind: &MessageKind) -> String {
+    match kind {
+        MessageKind::Text => "text",
+        MessageKind::Image => "image",
+        MessageKind::Video => "video",
+        MessageKind::VideoNote => "video_note",
+        MessageKind::Audio => "audio",
+        MessageKind::VoiceNote => "ptt",
+        MessageKind::Sticker => "sticker",
+        MessageKind::Document => "document",
+        MessageKind::Contact => "contact",
+        MessageKind::Location => "location",
+        MessageKind::Poll => "poll",
+        MessageKind::Event => "event",
+        MessageKind::GroupInvite => "group_invite",
+        MessageKind::Template => "template",
+        MessageKind::TemplateReply => "template_reply",
+        MessageKind::Buttons => "buttons",
+        MessageKind::ButtonsResponse => "buttons_response",
+        MessageKind::List => "list",
+        MessageKind::ListResponse => "list_response",
+        MessageKind::Interactive => "interactive",
+        MessageKind::InteractiveResponse => "interactive_response",
+        MessageKind::Undecryptable => "undecryptable",
+        MessageKind::ViewOnce => "view_once",
+        MessageKind::Hosted => "hosted",
+        MessageKind::Bot => "bot",
+        MessageKind::Unknown => "unknown",
+        MessageKind::Other(slug) => slug.as_str(),
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+#[utoipa::path(
+    get,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/messages",
+    tag = "messages",
+    params(
+        ("session_id" = String, Path, description = "Session ID"),
+        SessionMessagesQuery,
+    ),
+    responses(
+        (status = 200, description = "Session-wide history in store-arrival order, newest first, with cursor pagination", body = SessionMessagesResponse),
+        (status = 404, description = "Session not found"),
+        (status = 503, description = "Not connected")
+    )
+)]
+pub async fn list_session_messages(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<SessionMessagesQuery>,
+) -> Result<Json<SessionMessagesResponse>, ApiError> {
+    let runtime = state
+        .get_session(&session_id)
+        .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
+    let store = runtime.get_chat_store().ok_or(ApiError::NotConnected)?;
+
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let after = q.after.map(|seq| ArrivalCursor { seq });
+    let page = store
+        .messages_by_arrival(after, limit)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let next_cursor = if page.len() as i64 == limit {
+        page.last().map(|m| m.seq)
+    } else {
+        None
+    };
+
+    let mut push_names: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut messages = Vec::with_capacity(page.len());
+    for m in &page {
+        let sender = m.sender_jid.to_string();
+        let push_name = if m.from_me {
+            None
+        } else {
+            match push_names.get(&sender) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let name = store
+                        .contact(&m.sender_jid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.display_name().map(|s| s.to_string()));
+                    push_names.insert(sender.clone(), name.clone());
+                    name
+                }
+            }
+        };
+        messages.push(MessageHit {
+            id: m.seq,
+            message_id: m.id.clone(),
+            session_id: session_id.clone(),
+            chat_jid: m.chat_jid.to_string(),
+            sender_jid: sender,
+            direction: if m.from_me { "out" } else { "in" }.to_string(),
+            msg_type: message_kind_slug(&m.kind),
+            body: m.text.clone(),
+            snippet: None,
+            msg_timestamp: m.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            push_name,
+            media: m
+                .message
+                .as_deref()
+                .and_then(crate::handlers::sessions::extract_media_pointer)
+                .and_then(|p| media_pointer_to_model(&p)),
+        });
+    }
+
+    Ok(Json(SessionMessagesResponse {
+        count: messages.len(),
+        messages,
+        next_cursor,
+    }))
+}
+
 fn media_pointer_to_model(m: &MediaPointer) -> Option<MessageMedia> {
     let media_type = match m.media_type.as_str() {
         "image" => MediaType::Image,
@@ -267,5 +391,24 @@ fn rows_to_response(rows: Vec<MessageRow>) -> MessageSearchResponse {
     MessageSearchResponse {
         count: messages.len(),
         messages,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_kind_slug_matches_gateway_slugs() {
+        assert_eq!(message_kind_slug(&MessageKind::Text), "text");
+        assert_eq!(message_kind_slug(&MessageKind::Image), "image");
+        assert_eq!(message_kind_slug(&MessageKind::VoiceNote), "ptt");
+        assert_eq!(message_kind_slug(&MessageKind::Document), "document");
+        assert_eq!(message_kind_slug(&MessageKind::Sticker), "sticker");
+        assert_eq!(
+            message_kind_slug(&MessageKind::Other("protocol".to_string())),
+            "protocol"
+        );
+        assert_eq!(message_kind_slug(&MessageKind::Unknown), "unknown");
     }
 }

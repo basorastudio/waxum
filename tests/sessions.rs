@@ -484,3 +484,183 @@ async fn create_with_reuse_on_unknown_id_creates_normally() {
         Some("s-fresh")
     );
 }
+
+/// `POST /sessions/{id}/pause` and `/resume` drive the upstream
+/// `Client::pause`/`resume`, so they need an installed client instance —
+/// a session that exists only as a DB row gets 503, not 404/200.
+#[tokio::test]
+async fn pause_resume_require_an_installed_client() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-pause"}),
+        ),
+    )
+    .await;
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-pause/pause",
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-pause/resume",
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/ghost/pause",
+            Some(TEST_TOKEN),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// `/status` exposes the upstream `Client::is_paused` state; with no
+/// client installed it must report `false` rather than omit the field.
+#[tokio::test]
+async fn status_reports_paused_false_without_client() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-paused-f"}),
+        ),
+    )
+    .await;
+    let (status, body) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-paused-f/status", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("paused").and_then(|v| v.as_bool()), Some(false));
+}
+
+/// `POST /sessions/{id}/appstate/resync` validates collection names and
+/// the mode before ever touching the client, so bad input is a 400 even
+/// with no session connected.
+#[tokio::test]
+async fn appstate_resync_validates_request_body() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-resync"}),
+        ),
+    )
+    .await;
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-resync/appstate/resync",
+            Some(TEST_TOKEN),
+            json!({"collections": ["bogus_collection"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-resync/appstate/resync",
+            Some(TEST_TOKEN),
+            json!({"collections": ["regular"], "mode": "full"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-resync/appstate/resync",
+            Some(TEST_TOKEN),
+            json!({"collections": []}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/s-resync/appstate/resync",
+            Some(TEST_TOKEN),
+            json!({"collections": ["critical_block", "regular"], "mode": "snapshot"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a valid request with no live client reaches the 503 gate"
+    );
+}
+
+/// `GET /sessions/{id}/messages` pages the upstream chat store, which only
+/// exists while a client is installed — a session with a runtime but no
+/// connected client answers 503, an unknown session 404.
+#[tokio::test]
+async fn list_session_messages_requires_runtime() {
+    let h = Harness::new().await;
+    let _ = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(TEST_TOKEN),
+            json!({"id": "s-arrival"}),
+        ),
+    )
+    .await;
+
+    let (status, _) = call(
+        &h.app,
+        req_get("/api/v1/sessions/s-arrival/messages", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (status, _) = call(
+        &h.app,
+        req_get("/api/v1/sessions/ghost/messages", Some(TEST_TOKEN)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

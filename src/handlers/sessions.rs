@@ -268,7 +268,7 @@ pub async fn get_session_status(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
-    let (status, is_logged_in, socket_alive, pair) =
+    let (status, is_logged_in, socket_alive, paused, pair) =
         if let Some(runtime) = state.get_session(&session_id) {
             let ps = runtime.get_pair_state();
             let pair = crate::models::sessions::PairStatus {
@@ -279,8 +279,9 @@ pub async fn get_session_status(
                 attempts: ps.attempts,
             };
             let socket_alive = runtime.socket_alive();
+            let paused = runtime.get_client().map(|c| c.is_paused()).unwrap_or(false);
             if runtime.is_alive() {
-                (SessionStatus::LoggedIn, true, socket_alive, pair)
+                (SessionStatus::LoggedIn, true, socket_alive, paused, pair)
             } else {
                 let s = runtime.get_status();
                 let (status, is_logged_in) = if s == SessionStatus::LoggedIn {
@@ -288,12 +289,13 @@ pub async fn get_session_status(
                 } else {
                     (s, false)
                 };
-                (status, is_logged_in, socket_alive, pair)
+                (status, is_logged_in, socket_alive, paused, pair)
             }
         } else {
             (
                 session.status,
                 session.is_logged_in,
+                false,
                 false,
                 crate::models::sessions::PairStatus::default(),
             )
@@ -303,6 +305,7 @@ pub async fn get_session_status(
         status,
         is_logged_in,
         socket_alive,
+        paused,
         phone_number: session.phone_number,
         push_name: session.push_name,
         pair,
@@ -1137,6 +1140,7 @@ async fn connect_client(
     let backend = SqliteStore::new(&db_path)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let chat_store_backend = backend.clone();
 
     let transport_factory = TokioWebSocketTransportFactory::new();
     let http_client = crate::net::build_http_client();
@@ -1178,6 +1182,16 @@ async fn connect_client(
             std::sync::atomic::Ordering::Relaxed,
         );
         c.set_skip_history_sync(runtime.skip_history_sync());
+        match whatsapp_rust_chat_store::ChatStore::new(&chat_store_backend).await {
+            Ok(store) => {
+                let subscription = c.subscribe_handler(store.handler());
+                runtime.set_chat_store(store, subscription);
+            }
+            Err(e) => {
+                tracing::warn!("chat store unavailable for session {}: {}", session_id, e);
+            }
+        }
+        runtime.set_enc_decrypt_failed_lease(c.acquire_enc_decrypt_failed_forwarding());
         runtime.set_client(Some(c));
         runtime.set_status(SessionStatus::WaitingForQr);
     }
@@ -1227,6 +1241,7 @@ async fn connect_client_with_pair_code(
     let backend = SqliteStore::new(&db_path)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let chat_store_backend = backend.clone();
 
     let transport_factory = TokioWebSocketTransportFactory::new();
     let http_client = crate::net::build_http_client();
@@ -1276,6 +1291,16 @@ async fn connect_client_with_pair_code(
             std::sync::atomic::Ordering::Relaxed,
         );
         c.set_skip_history_sync(runtime.skip_history_sync());
+        match whatsapp_rust_chat_store::ChatStore::new(&chat_store_backend).await {
+            Ok(store) => {
+                let subscription = c.subscribe_handler(store.handler());
+                runtime.set_chat_store(store, subscription);
+            }
+            Err(e) => {
+                tracing::warn!("chat store unavailable for session {}: {}", session_id, e);
+            }
+        }
+        runtime.set_enc_decrypt_failed_lease(c.acquire_enc_decrypt_failed_forwarding());
         runtime.set_client(Some(c));
     }
 
@@ -1559,6 +1584,9 @@ fn get_event_type(event: &wacore::types::events::Event) -> String {
         Event::ClientOutdated(_) => "client_outdated".to_string(),
         Event::OfflineSyncPreview(_) => "offline_sync_preview".to_string(),
         Event::OfflineSyncCompleted(_) => "offline_sync_completed".to_string(),
+        Event::CallLogSync(_) => "call_log_sync".to_string(),
+        Event::StreamError(_) => "stream_error".to_string(),
+        Event::EncDecryptFailed(_) => "enc_decrypt_failed".to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -2130,6 +2158,31 @@ fn event_to_json(event: &wacore::types::events::Event, session_id: &str) -> serd
                 "info": format!("{:?}", completed),
             })
         }
+        Event::CallLogSync(sync) => {
+            serde_json::json!({
+                "call_creator_jid": sync.call_creator_jid.to_string(),
+                "call_id": sync.call_id,
+                "from_me": sync.from_me,
+                "timestamp": sync.timestamp.timestamp(),
+                "from_full_sync": sync.from_full_sync,
+                "record": format!("{:?}", sync.record),
+            })
+        }
+        Event::StreamError(err) => {
+            serde_json::json!({
+                "code": err.code,
+            })
+        }
+        Event::EncDecryptFailed(failed) => {
+            serde_json::json!({
+                "chat": failed.info.source.chat.to_string(),
+                "sender": failed.info.source.sender.to_string(),
+                "message_id": failed.info.id,
+                "enc_index": failed.enc_index,
+                "enc_type": failed.enc_type,
+                "reason": format!("{:?}", failed.reason),
+            })
+        }
         _ => serde_json::json!({}),
     };
 
@@ -2144,6 +2197,83 @@ fn event_to_json(event: &wacore::types::events::Event, session_id: &str) -> serd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_event_variants_map_to_their_webhook_names() {
+        use wacore::types::events::{CallLogSync, EncDecryptFailed, Event, StreamError};
+
+        let stream_error =
+            Event::StreamError(StreamError::builder().code("429".to_string()).build());
+        assert_eq!(get_event_type(&stream_error), "stream_error");
+
+        let call_log = Event::CallLogSync(
+            CallLogSync::builder()
+                .call_creator_jid("12345@s.whatsapp.net".parse().unwrap())
+                .call_id("call-1".to_string())
+                .from_me(true)
+                .timestamp(chrono::Utc::now())
+                .record(Box::new(waproto::whatsapp::CallLogRecord::default()))
+                .from_full_sync(false)
+                .build(),
+        );
+        assert_eq!(get_event_type(&call_log), "call_log_sync");
+
+        let enc_failed = Event::EncDecryptFailed(
+            EncDecryptFailed::builder()
+                .info(std::sync::Arc::new(
+                    wacore::types::message::MessageInfo::default(),
+                ))
+                .enc_index(1)
+                .enc_type(std::borrow::Cow::Borrowed("skmsg"))
+                .reason(wacore::types::events::EncDecryptFailureReason::NoSession)
+                .build(),
+        );
+        assert_eq!(get_event_type(&enc_failed), "enc_decrypt_failed");
+    }
+
+    #[test]
+    fn new_event_variants_serialize_with_event_name_and_data() {
+        use wacore::types::events::{CallLogSync, EncDecryptFailed, Event, StreamError};
+
+        let stream_error =
+            Event::StreamError(StreamError::builder().code("429".to_string()).build());
+        let json = event_to_json(&stream_error, "sess");
+        assert_eq!(json["event"], "stream_error");
+        assert_eq!(json["session_id"], "sess");
+        assert_eq!(json["data"]["code"], "429");
+
+        let call_log = Event::CallLogSync(
+            CallLogSync::builder()
+                .call_creator_jid("12345@s.whatsapp.net".parse().unwrap())
+                .call_id("call-1".to_string())
+                .from_me(true)
+                .timestamp(chrono::Utc::now())
+                .record(Box::new(waproto::whatsapp::CallLogRecord::default()))
+                .from_full_sync(true)
+                .build(),
+        );
+        let json = event_to_json(&call_log, "sess");
+        assert_eq!(json["event"], "call_log_sync");
+        assert_eq!(json["data"]["call_id"], "call-1");
+        assert_eq!(json["data"]["from_me"], true);
+        assert_eq!(json["data"]["from_full_sync"], true);
+
+        let enc_failed = Event::EncDecryptFailed(
+            EncDecryptFailed::builder()
+                .info(std::sync::Arc::new(
+                    wacore::types::message::MessageInfo::default(),
+                ))
+                .enc_index(2)
+                .enc_type(std::borrow::Cow::Borrowed("pkmsg"))
+                .reason(wacore::types::events::EncDecryptFailureReason::BadMac)
+                .build(),
+        );
+        let json = event_to_json(&enc_failed, "sess");
+        assert_eq!(json["event"], "enc_decrypt_failed");
+        assert_eq!(json["data"]["enc_index"], 2);
+        assert_eq!(json["data"]["enc_type"], "pkmsg");
+        assert_eq!(json["data"]["reason"], "BadMac");
+    }
 
     #[test]
     fn zip_round_trips_nested_directory() {
