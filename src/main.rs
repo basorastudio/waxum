@@ -223,6 +223,9 @@ use state::AppState;
         handlers::operations::get_auto_reconnect,
         handlers::operations::set_history_sync,
         handlers::operations::get_history_sync,
+        handlers::operations::pause_session,
+        handlers::operations::resume_session,
+        handlers::operations::appstate_resync,
 
         handlers::webhooks::list_webhooks,
         handlers::webhooks::register_webhook,
@@ -247,6 +250,7 @@ use state::AppState;
         handlers::search::search_session_messages,
         handlers::search::search_all_messages,
         handlers::search::list_chat_messages,
+        handlers::search::list_session_messages,
 
         handlers::tokens::mint_token,
         handlers::tokens::list_tokens,

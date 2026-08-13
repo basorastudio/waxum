@@ -2,6 +2,68 @@
 
 All notable changes to **waxum** will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+Bumped the vendored `whatsapp-rust` (and `wacore`/`wacore-binary`/
+`waproto`/`whatsapp-rust-sqlite-storage`/`whatsapp-rust-tokio-transport`/
+`whatsapp-rust-ureq-http-client`) git rev from `5e084b9b` to `8cea605f`
+(upstream `0.7.0`), and added `whatsapp-rust-chat-store` at the same rev.
+No compile breaks from the bump itself; the new upstream capabilities are
+wired below.
+
+### Added — new webhook/NATS events
+
+Three new upstream events now fan out to webhooks, NATS and the console
+event feed, with matching `WebhookEvent` values for subscription
+filtering:
+
+- `call_log_sync` — a call-history record synced from the primary device
+  (upstream `Event::CallLogSync`). Payload carries `call_creator_jid`,
+  `call_id`, `from_me`, `timestamp`, `from_full_sync` and the raw record.
+- `stream_error` — a server-side stream error stanza such as a 429 rate
+  limit (upstream `Event::StreamError`). Payload carries `code`.
+- `enc_decrypt_failed` — an inbound `<enc>` that produced no plaintext,
+  with the reason (upstream `Event::EncDecryptFailed`). Payload carries
+  `chat`, `sender`, `message_id`, `enc_index`, `enc_type` and `reason`.
+  Upstream gates this event behind a forwarding lease; the gateway now
+  acquires `Client::acquire_enc_decrypt_failed_forwarding()` for every
+  connected client so the event actually fires.
+
+### Added — `POST /sessions/{id}/pause` + `POST /sessions/{id}/resume`
+
+Take a session offline and bring it back on the caller's word (upstream
+`Client::pause`/`resume`/`is_paused`). Both return `{"paused": bool}`;
+both require an installed client (503 otherwise). `GET /sessions/{id}/status`
+gained a `paused` field sourced from `Client::is_paused()` (`false` when
+no client is installed).
+
+### Added — `POST /sessions/{id}/appstate/resync`
+
+Consumer-driven re-sync of app-state collections (upstream
+`Client::resync_app_state`). Body: `{"collections": ["critical_block",
+"critical_unblock_low", "regular_low", "regular_high", "regular"], "mode":
+"incremental"|"snapshot"}` (`mode` defaults to `incremental`; `snapshot`
+discards stored state and rebuilds from the server's snapshot). Returns
+the per-collection report `{"synced", "fatal", "retryable", "skipped",
+"all_synced"}`. Unknown collection names and unknown modes are rejected
+with 400 before any request reaches the wire; requires a live client
+(503 otherwise).
+
+### Added — `GET /sessions/{id}/messages`
+
+Session-wide message listing in store-arrival order (newest first),
+backed by the upstream chat store's `messages_by_arrival`, which the
+gateway now materializes into each session's `whatsapp.db`. Keyset
+pagination: `?after=<seq>&limit=<n>` (default 20, max 200), with the
+response's `next_cursor` passed back as `after` for the next (older)
+page; `next_cursor` is `null` on a short page. Per-message fields mirror
+the chat-scoped listing (`id`, `message_id`, `session_id`, `chat_jid`,
+`sender_jid`, `direction`, `msg_type`, `body`, `msg_timestamp`,
+`push_name`, `media` download pointer). Requires a live client (503 when
+no chat store is installed).
+
 ## [0.12.0] - 2026-08-10
 
 ### BREAKING — webhook signature scheme is now versioned (`v2`)

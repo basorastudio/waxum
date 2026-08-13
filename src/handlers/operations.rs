@@ -429,6 +429,67 @@ pub async fn get_history_sync(
     }))
 }
 
+/// Response of the pause/resume endpoints.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct PauseStateResponse {
+    /// Whether the session is paused after the operation.
+    pub paused: bool,
+}
+
+#[utoipa::path(
+    post,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/pause",
+    tag = "operations",
+    params(
+        ("session_id" = String, Path, description = "Session ID")
+    ),
+    responses(
+        (status = 200, description = "Session paused", body = PauseStateResponse),
+        (status = 404, description = "Session not found"),
+        (status = 503, description = "Not connected")
+    )
+)]
+pub async fn pause_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<PauseStateResponse>, ApiError> {
+    let client = get_installed_client(&state, &session_id)?;
+
+    client.pause().await;
+
+    Ok(Json(PauseStateResponse {
+        paused: client.is_paused(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/resume",
+    tag = "operations",
+    params(
+        ("session_id" = String, Path, description = "Session ID")
+    ),
+    responses(
+        (status = 200, description = "Session resumed", body = PauseStateResponse),
+        (status = 404, description = "Session not found"),
+        (status = 503, description = "Not connected")
+    )
+)]
+pub async fn resume_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<PauseStateResponse>, ApiError> {
+    let client = get_installed_client(&state, &session_id)?;
+
+    client.resume();
+
+    Ok(Json(PauseStateResponse {
+        paused: client.is_paused(),
+    }))
+}
+
 fn get_client(
     state: &AppState,
     session_id: &str,
@@ -438,6 +499,144 @@ fn get_client(
         .ok_or(ApiError::NotConnected)?;
 
     runtime.get_live_client().ok_or(ApiError::NotConnected)
+}
+
+/// Resolve the installed client without requiring a live socket. A paused
+/// session has no connection by definition, so pause/resume must not gate
+/// on [`SessionState::get_live_client`] the way send-path handlers do;
+/// they only need the client instance itself to be installed.
+fn get_installed_client(
+    state: &AppState,
+    session_id: &str,
+) -> Result<std::sync::Arc<whatsapp_rust::Client>, ApiError> {
+    let runtime = state
+        .get_session(session_id)
+        .ok_or(ApiError::NotConnected)?;
+
+    runtime.get_client().ok_or(ApiError::NotConnected)
+}
+
+/// Request body for `POST /sessions/{id}/appstate/resync`.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppStateResyncRequest {
+    /// Collections to re-fetch: `critical_block`, `critical_unblock_low`,
+    /// `regular_low`, `regular_high`, `regular`.
+    pub collections: Vec<String>,
+    /// `incremental` (default) asks for patches after the stored version;
+    /// `snapshot` discards the stored state and rebuilds the collection
+    /// from the server's snapshot.
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AppStateResyncResponse {
+    /// Fetched, applied and persisted.
+    pub synced: Vec<String>,
+    /// Refused by the server outright (400/404); retrying will not clear these.
+    pub fatal: Vec<String>,
+    /// Not synced, but a later attempt can succeed.
+    pub retryable: Vec<String>,
+    /// Left to another sync already fetching the collection.
+    pub skipped: Vec<String>,
+    /// True when every requested collection came back synced.
+    pub all_synced: bool,
+}
+
+/// Parse one collection name against upstream's [`whatsapp_rust::WAPatchName`],
+/// rejecting anything that falls back to `Unknown` — that variant is a parse
+/// fallback, not a collection the server has, and upstream refuses a request
+/// that names it.
+fn parse_patch_name(name: &str) -> Result<whatsapp_rust::WAPatchName, ApiError> {
+    use std::str::FromStr;
+
+    let parsed =
+        whatsapp_rust::WAPatchName::from_str(name).unwrap_or(whatsapp_rust::WAPatchName::Unknown);
+    if parsed == whatsapp_rust::WAPatchName::Unknown {
+        return Err(ApiError::BadRequest(format!(
+            "unknown app-state collection: {name} (expected one of: critical_block, \
+             critical_unblock_low, regular_low, regular_high, regular)"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_resync_mode(mode: Option<&str>) -> Result<whatsapp_rust::AppStateResyncMode, ApiError> {
+    match mode {
+        None | Some("incremental") => Ok(whatsapp_rust::AppStateResyncMode::Incremental),
+        Some("snapshot") => Ok(whatsapp_rust::AppStateResyncMode::Snapshot),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "unknown resync mode: {other} (expected \"incremental\" or \"snapshot\")"
+        ))),
+    }
+}
+
+#[utoipa::path(
+    post,
+    security(("bearer_auth" = [])),
+    path = "/api/v1/sessions/{session_id}/appstate/resync",
+    tag = "operations",
+    params(
+        ("session_id" = String, Path, description = "Session ID")
+    ),
+    request_body = AppStateResyncRequest,
+    responses(
+        (status = 200, description = "App-state resync report", body = AppStateResyncResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 404, description = "Session not found"),
+        (status = 503, description = "Not connected")
+    )
+)]
+pub async fn appstate_resync(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<AppStateResyncRequest>,
+) -> Result<Json<AppStateResyncResponse>, ApiError> {
+    if request.collections.is_empty() {
+        return Err(ApiError::BadRequest(
+            "collections must not be empty".to_string(),
+        ));
+    }
+    let collections = request
+        .collections
+        .iter()
+        .map(|name| parse_patch_name(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mode = parse_resync_mode(request.mode.as_deref())?;
+
+    let client = get_client(&state, &session_id)?;
+    let report = client
+        .resync_app_state(collections, mode)
+        .await
+        .map_err(|e| match e {
+            whatsapp_rust::AppStateError::NotConnected => ApiError::NotConnected,
+            whatsapp_rust::AppStateError::InvalidRequest(msg) => ApiError::BadRequest(msg),
+            whatsapp_rust::AppStateError::Internal(err) => ApiError::Internal(err.to_string()),
+            other => ApiError::Internal(other.to_string()),
+        })?;
+
+    Ok(Json(AppStateResyncResponse {
+        synced: report
+            .synced
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        fatal: report
+            .fatal
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        retryable: report
+            .retryable
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        skipped: report
+            .skipped
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        all_synced: report.all_synced(),
+    }))
 }
 
 /// Resolve the session's runtime for per-session config read/write
@@ -469,4 +668,50 @@ async fn config_runtime(
         .unwrap_or_else(|| format!("{}/{}", state.base_storage_path(), session_id));
 
     Ok(state.get_or_create_session(session_id, &storage_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_patch_name_accepts_every_real_collection() {
+        for (name, expected) in [
+            ("critical_block", whatsapp_rust::WAPatchName::CriticalBlock),
+            (
+                "critical_unblock_low",
+                whatsapp_rust::WAPatchName::CriticalUnblockLow,
+            ),
+            ("regular_low", whatsapp_rust::WAPatchName::RegularLow),
+            ("regular_high", whatsapp_rust::WAPatchName::RegularHigh),
+            ("regular", whatsapp_rust::WAPatchName::Regular),
+        ] {
+            assert_eq!(parse_patch_name(name).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn parse_patch_name_rejects_unknown_and_the_unknown_fallback() {
+        assert!(parse_patch_name("bogus").is_err());
+        assert!(parse_patch_name("").is_err());
+        assert!(parse_patch_name("unknown").is_err());
+        assert!(parse_patch_name("Critical_Block").is_err());
+    }
+
+    #[test]
+    fn parse_resync_mode_defaults_to_incremental() {
+        assert_eq!(
+            parse_resync_mode(None).unwrap(),
+            whatsapp_rust::AppStateResyncMode::Incremental
+        );
+        assert_eq!(
+            parse_resync_mode(Some("incremental")).unwrap(),
+            whatsapp_rust::AppStateResyncMode::Incremental
+        );
+        assert_eq!(
+            parse_resync_mode(Some("snapshot")).unwrap(),
+            whatsapp_rust::AppStateResyncMode::Snapshot
+        );
+        assert!(parse_resync_mode(Some("full")).is_err());
+    }
 }

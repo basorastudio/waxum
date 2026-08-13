@@ -217,6 +217,10 @@ pub struct SessionStatusResponse {
     /// dead socket ("limbo"), and a live socket can precede login
     /// during QR/pair flows.
     pub socket_alive: bool,
+    /// Whether the session is paused (`POST /sessions/{id}/pause`): the
+    /// client deliberately keeps no connection open until resumed.
+    /// `false` when there is no live client in this process.
+    pub paused: bool,
     /// Phone number if available
     pub phone_number: Option<String>,
     /// Display name if available

@@ -274,6 +274,10 @@ fn session_routes() -> Router<AppState> {
             get(handlers::search::list_chat_messages),
         )
         .route(
+            "/{session_id}/messages",
+            get(handlers::search::list_session_messages),
+        )
+        .route(
             "/{session_id}/messages/newsletter-forward",
             post(handlers::messages::send_newsletter_forward),
         )
@@ -529,6 +533,18 @@ fn session_routes() -> Router<AppState> {
         .route(
             "/{session_id}/history-sync",
             get(handlers::operations::get_history_sync).put(handlers::operations::set_history_sync),
+        )
+        .route(
+            "/{session_id}/pause",
+            post(handlers::operations::pause_session),
+        )
+        .route(
+            "/{session_id}/resume",
+            post(handlers::operations::resume_session),
+        )
+        .route(
+            "/{session_id}/appstate/resync",
+            post(handlers::operations::appstate_resync),
         )
         .route(
             "/{session_id}/media/upload",

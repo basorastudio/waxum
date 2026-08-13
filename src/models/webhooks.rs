@@ -78,6 +78,20 @@ pub enum WebhookEvent {
     BlastProgress,
 
     BlastCompleted,
+
+    /// A call-history record synced from the primary device
+    /// (upstream `Event::CallLogSync`).
+    CallLogSync,
+
+    /// A server-side stream error stanza (e.g. a 429 rate limit), surfaced
+    /// as upstream `Event::StreamError`.
+    StreamError,
+
+    /// An inbound `<enc>` payload that produced no plaintext, with the
+    /// reason. Upstream only emits this while the gateway holds the
+    /// enc-decrypt-failed forwarding lease, which it acquires for every
+    /// connected client.
+    EncDecryptFailed,
 }
 
 impl WebhookEvent {
@@ -113,6 +127,9 @@ impl WebhookEvent {
             WebhookEvent::ScheduledFailed => event == "scheduled_failed",
             WebhookEvent::BlastProgress => event == "blast_progress",
             WebhookEvent::BlastCompleted => event == "blast_completed",
+            WebhookEvent::CallLogSync => event == "call_log_sync",
+            WebhookEvent::StreamError => event == "stream_error",
+            WebhookEvent::EncDecryptFailed => event == "enc_decrypt_failed",
         }
     }
 
@@ -148,6 +165,9 @@ impl WebhookEvent {
             WebhookEvent::ScheduledFailed => "scheduled_failed",
             WebhookEvent::BlastProgress => "blast_progress",
             WebhookEvent::BlastCompleted => "blast_completed",
+            WebhookEvent::CallLogSync => "call_log_sync",
+            WebhookEvent::StreamError => "stream_error",
+            WebhookEvent::EncDecryptFailed => "enc_decrypt_failed",
         }
     }
 
@@ -186,6 +206,9 @@ impl WebhookEvent {
             "scheduled_failed" => Some(WebhookEvent::ScheduledFailed),
             "blast_progress" => Some(WebhookEvent::BlastProgress),
             "blast_completed" => Some(WebhookEvent::BlastCompleted),
+            "call_log_sync" => Some(WebhookEvent::CallLogSync),
+            "stream_error" => Some(WebhookEvent::StreamError),
+            "enc_decrypt_failed" => Some(WebhookEvent::EncDecryptFailed),
             _ => None,
         }
     }
