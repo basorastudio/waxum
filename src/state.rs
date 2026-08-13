@@ -214,6 +214,23 @@ pub struct SessionState {
     /// skip-history-sync flag, stored gateway-side and applied to every
     /// newly built client.
     pub skip_history_sync_pref: AtomicBool,
+
+    /// Held while a client is installed so the client keeps emitting
+    /// `Event::EncDecryptFailed` (upstream gates the event on at least one
+    /// lease being held; dropping the last lease silences it). Acquired in
+    /// `connect_client` alongside `set_client` and dropped with the client.
+    pub enc_decrypt_failed_lease: RwLock<Option<whatsapp_rust::EncDecryptFailedLease>>,
+
+    /// Session-wide message history materialized into the session's
+    /// whatsapp.db by the upstream chat store. Backs
+    /// `GET /sessions/{id}/messages`. Installed alongside the client;
+    /// `None` when there is no live client (or the store failed to open,
+    /// which is logged and non-fatal).
+    pub chat_store: RwLock<Option<Arc<whatsapp_rust_chat_store::ChatStore>>>,
+
+    /// Keeps the chat store's event handler subscribed; dropping it
+    /// unsubscribes. Always mirrors the `chat_store` slot.
+    pub chat_store_subscription: RwLock<Option<wacore::types::events::Subscription>>,
 }
 
 /// Snapshot of the latest pair attempt for a session. Lives entirely in
@@ -244,6 +261,9 @@ impl SessionState {
             lock_strikes: RwLock::new(0),
             auto_reconnect_pref: AtomicBool::new(true),
             skip_history_sync_pref: AtomicBool::new(false),
+            enc_decrypt_failed_lease: RwLock::new(None),
+            chat_store: RwLock::new(None),
+            chat_store_subscription: RwLock::new(None),
         }
     }
 
@@ -382,7 +402,34 @@ impl SessionState {
     }
 
     pub fn set_client(&self, client: Option<Arc<Client>>) {
+        if client.is_none() {
+            *self.enc_decrypt_failed_lease.write() = None;
+            *self.chat_store.write() = None;
+            *self.chat_store_subscription.write() = None;
+        }
         *self.client.write() = client;
+    }
+
+    /// Install the [`whatsapp_rust::EncDecryptFailedLease`] for the current
+    /// client; call right after building a client, before [`Self::set_client`].
+    pub fn set_enc_decrypt_failed_lease(&self, lease: whatsapp_rust::EncDecryptFailedLease) {
+        *self.enc_decrypt_failed_lease.write() = Some(lease);
+    }
+
+    /// Install the chat store and the subscription keeping its event
+    /// handler registered; call right after building a client, before
+    /// [`Self::set_client`].
+    pub fn set_chat_store(
+        &self,
+        store: Arc<whatsapp_rust_chat_store::ChatStore>,
+        subscription: wacore::types::events::Subscription,
+    ) {
+        *self.chat_store.write() = Some(store);
+        *self.chat_store_subscription.write() = Some(subscription);
+    }
+
+    pub fn get_chat_store(&self) -> Option<Arc<whatsapp_rust_chat_store::ChatStore>> {
+        self.chat_store.read().clone()
     }
 
     pub fn get_qr_codes(&self) -> Vec<String> {

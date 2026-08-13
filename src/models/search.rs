@@ -118,6 +118,33 @@ pub struct ChatMessagesQuery {
     pub offset: Option<i64>,
 }
 
+/// Query params for `GET /api/v1/sessions/{session_id}/messages`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct SessionMessagesQuery {
+    /// Keyset cursor: the `seq` of the last message on the previous page,
+    /// taken verbatim from `next_cursor`. Omit for the newest page.
+    pub after: Option<i64>,
+
+    /// Page size (default 20, max 200).
+    pub limit: Option<i64>,
+}
+
+/// Session-wide message page in store-arrival order (newest first),
+/// backed by the upstream chat store rather than the search index.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SessionMessagesResponse {
+    pub messages: Vec<MessageHit>,
+
+    /// Messages in THIS page.
+    #[schema(example = 20)]
+    pub count: usize,
+
+    /// Pass as `after` to fetch the next (older) page. Null on a short
+    /// page, which means the end of the stored history.
+    #[schema(example = 421)]
+    pub next_cursor: Option<i64>,
+}
+
 /// Query params for the fleet-wide `GET /api/v1/messages/search`.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct MessageFleetSearchQuery {

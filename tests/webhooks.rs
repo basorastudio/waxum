@@ -177,3 +177,37 @@ async fn dlq_replay_missing_entry_returns_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// The upstream-sync event variants (`call_log_sync`, `stream_error`,
+/// `enc_decrypt_failed`) are valid `WebhookEvent` values end to end:
+/// accepted at registration and echoed back by the list endpoint.
+#[tokio::test]
+async fn register_webhook_accepts_upstream_sync_events() {
+    let h = Harness::new().await;
+    seed_session(&h, "wh-sync-01").await;
+    let (status, body) = call(
+        &h.app,
+        req_json(
+            Method::POST,
+            "/api/v1/sessions/wh-sync-01/webhooks",
+            Some(TEST_TOKEN),
+            json!({
+                "url": "https://example.com/hook",
+                "events": ["call_log_sync", "stream_error", "enc_decrypt_failed"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<&str> = body
+        .get("events")
+        .and_then(|v| v.as_array())
+        .expect("events array")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(
+        events,
+        vec!["call_log_sync", "stream_error", "enc_decrypt_failed"]
+    );
+}
